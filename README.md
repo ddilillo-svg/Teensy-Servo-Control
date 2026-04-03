@@ -36,7 +36,7 @@ This project was built for Project 399 to remotely actuate a mechanical servo-dr
 - When the switch crosses a threshold (ON): executes a **deploy sequence** — moving each of the 9 servos to their target positions in a defined order with configurable hold times between steps.
 - When the switch returns low (OFF): executes a **retract sequence** in reverse.
 - State machine prevents mid-sequence interruption and ensures clean transitions.
-- **Onboard LED (Pin 13)** stays ON at power-up and blinks on every servo activation step.
+- **Onboard LED (Pin 13)** provides three distinct visual states — see [LED Feedback](#45-led-feedback).
 
 **Why Teensy 3.2?**
 
@@ -171,40 +171,73 @@ The firmware uses a **non-blocking state machine** with four states:
 
 ### 4.5 LED Feedback
 
-The onboard LED (pin 13 / `LED_BUILTIN`) provides two visual status indicators:
+The onboard LED (pin 13 / `LED_BUILTIN`) provides three distinct visual states.  
+All LED transitions are **fully non-blocking** — implemented as a state machine driven by `millis()` with no `delay()` calls. This ensures servo timing and CRSF communication are never interrupted by LED updates.
 
-| Behavior | Meaning |
-|----------|--------|
-| **LED ON solid** | Board powered up and firmware running |
-| **LED blinks briefly** | A servo step was just activated (deploy or retract) |
+#### LED Behavior Table
 
-**Implementation:**
+| LED Pattern | Meaning |
+|-------------|---------|
+| **Solid ON** | Board is powered and firmware is running. No CRSF signal received yet. |
+| **Continuous blink** (200 ms ON / 200 ms OFF) | CRSF signal is actively being received from the ELRS receiver. |
+| **Double blink** (ON 100ms · OFF 100ms · ON 100ms · OFF 300ms, repeat) | A servo sequence is currently executing (deploy or retract). |
 
-```cpp
-#define LED_PIN      LED_BUILTIN   // pin 13 on Teensy 3.2
-#define LED_BLINK_MS 75            // blink duration in ms
+#### Priority
+
+When multiple conditions are true simultaneously, the highest-priority pattern wins:
+
+```
+1. Double-blink   (highest) — servo sequence is active
+2. Continuous blink          — CRSF signal present, no sequence running
+3. Solid ON       (lowest)  — board alive, no signal
 ```
 
-In `setup()`, the LED is configured as an output and driven HIGH immediately:
+#### Signal Detection
+
+CRSF frame arrival sets `signalPresent = true`. If no new frame is received within **500 ms** (`CRSF_SIGNAL_TIMEOUT_MS`), the flag clears and the LED reverts to solid ON. This window is long enough to survive the ~6.67 ms CRSF packet interval by a wide margin, but short enough to detect a genuine signal loss within half a second.
+
+#### Timing Constants
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `LED_SIGNAL_ON_MS` | `200` | Continuous blink: ON duration |
+| `LED_SIGNAL_OFF_MS` | `200` | Continuous blink: OFF duration |
+| `LED_SERVO_PULSE_MS` | `100` | Double-blink: each pulse ON/OFF duration |
+| `LED_SERVO_GAP_MS` | `300` | Double-blink: longer gap after second pulse |
+| `CRSF_SIGNAL_TIMEOUT_MS` | `500` | ms without a CRSF frame → signal considered lost |
+
+#### Implementation
+
+The LED is driven by `updateLed()`, called on every `loop()` iteration:
 
 ```cpp
-pinMode(LED_PIN, OUTPUT);
-digitalWrite(LED_PIN, HIGH);    // LED ON → board is live
-```
+// Called every loop() — zero blocking time
+void updateLed() {
+  LedMode desired = servoActive ? LED_MODE_SERVO
+                  : signalPresent ? LED_MODE_SIGNAL
+                  : LED_MODE_SOLID;
 
-Each time a servo step fires inside `runSequence()`, `blinkLed()` is called:
+  if (desired != ledMode) { /* reset phase, apply first output */ }
 
-```cpp
-void blinkLed() {
-  digitalWrite(LED_PIN, LOW);    // momentary OFF
-  delay(LED_BLINK_MS);           // 75 ms
-  digitalWrite(LED_PIN, HIGH);   // restore ON
+  // Advance phase within current pattern based on millis() elapsed
+  // ...
 }
 ```
 
-The blink is a short blocking delay (75 ms by default). Since all sequence hold times are ≥ 200 ms, this does **not** meaningfully impact servo timing. To change the blink duration, adjust `LED_BLINK_MS` in the configuration section at the top of `TeensyServoControl.ino`.
+CRSF frames update the signal-present flag:
 
-For a full 9-servo deploy sequence you will see **up to 11 blinks** (10 deploy steps + chained simultaneous pairs counted individually).
+```cpp
+if (crsf.hasNewFrame()) {
+    lastFrameMs   = millis();
+    signalPresent = true;
+    // ... read channels ...
+}
+
+// Timeout check (every loop):
+if (signalPresent && (millis() - lastFrameMs) > CRSF_SIGNAL_TIMEOUT_MS) {
+    signalPresent = false;
+}
+```
 
 ---
 
@@ -275,16 +308,20 @@ Step 10: Servo 0 → 1500 µs (latch/mid)   | hold 200 ms
 Open `Tools → Serial Monitor` at **115200 baud**. You should see:
 
 ```
-TeensyServoControl v2.1 — ready
+TeensyServoControl v3.0 — ready
 Servos on pins: 3, 4, 5, 6, 9, 10, 20, 21, 22
 Trigger channel: CH5
-LED pin: 13  Blink duration: 75 ms
+LED pin: 13
+LED modes: solid=powered, blink=signal, double-blink=servo active
 CH5: 172  Switch: OFF
 CH5: 172  Switch: OFF
 …
 ```
 
-The onboard LED (pin 13) will be **ON solid** as soon as the board boots. Each time you trigger the sequence, it will **blink once per servo step** as the sequence executes.
+**Expected LED behavior:**
+- **On first power-up (no receiver connected):** LED ON solid.
+- **After connecting ELRS receiver (bound and outputting):** LED starts continuous blinking (200 ms / 200 ms).
+- **When you flip the trigger switch:** LED switches to double-blink pattern for the duration of the servo sequence, then reverts to continuous blink.
 
 ---
 
@@ -305,7 +342,11 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 | `DEPLOY_SEQUENCE[]` | See code | Steps to run when switch goes ON |
 | `RETRACT_SEQUENCE[]` | See code | Steps to run when switch goes OFF |
 | `LED_PIN` | `LED_BUILTIN` (pin 13) | Onboard LED pin — do not change for Teensy 3.2 |
-| `LED_BLINK_MS` | `75` | LED blink duration in milliseconds per servo activation |
+| `LED_SIGNAL_ON_MS` | `200` | Continuous blink ON duration (signal present) |
+| `LED_SIGNAL_OFF_MS` | `200` | Continuous blink OFF duration (signal present) |
+| `LED_SERVO_PULSE_MS` | `100` | Double-blink each pulse duration (servo active) |
+| `LED_SERVO_GAP_MS` | `300` | Double-blink gap after second pulse (servo active) |
+| `CRSF_SIGNAL_TIMEOUT_MS` | `500` | ms without a CRSF frame before signal is marked lost |
 
 ### Changing the trigger channel
 
@@ -342,9 +383,11 @@ on the Teensy 3.2: `23`, `25`, `32`.
 With USB connected and Serial Monitor open at **115200 baud**:
 
 ```
-TeensyServoControl v2.0 — ready
+TeensyServoControl v3.0 — ready
 Servos on pins: 3, 4, 5, 6, 9, 10, 20, 21, 22
 Trigger channel: CH5
+LED pin: 13
+LED modes: solid=powered, blink=signal, double-blink=servo active
 CH5: 172  Switch: OFF       ← polling every 200 ms (non-blocking)
 CH5: 1811  Switch: ON
 → DEPLOYING
@@ -369,6 +412,8 @@ To reduce serial overhead in production, comment out the debug block inside the 
 | Upload fails | Teensy not in bootloader mode | Press the button on the Teensy or check USB connection |
 | `crsf_parser.h` not found | File not in same folder as `.ino` | Both files must be inside `TeensyServoControl/` folder |
 | Servos jitter or draw excess current | All 9 servos from same BEC | Ensure BEC is rated for the combined stall current (≥9 A recommended) |
+| LED stays solid, won't blink | No CRSF signal received | Check receiver wiring/binding; LED blinks only when frames arrive |
+| LED blinks but double-blink never shows | Switch threshold not crossed | Verify `TRIGGER_CHANNEL` and `SWITCH_THRESHOLD` settings |
 
 ---
 
@@ -380,6 +425,18 @@ MIT License — free to use, modify, and distribute.
 ---
 
 ## Changelog
+
+### v3.0
+- **Revised LED feedback** — three distinct non-blocking LED states:
+  - **Solid ON** — board powered, no CRSF signal (same as before)
+  - **Continuous blink** (200 ms / 200 ms) — CRSF signal actively being received *(new)*
+  - **Double blink** (ON 100ms / OFF 100ms / ON 100ms / OFF 300ms, looping) — servo sequence executing *(new)*
+- LED is now driven by a **non-blocking state machine** (`updateLed()`) — no `delay()` calls; servo timing and CRSF parsing are fully unaffected
+- Added `signalPresent` flag and `CRSF_SIGNAL_TIMEOUT_MS` timeout for signal-loss detection
+- Added `servoActive` flag set/cleared by the sequence state machine
+- Removed blocking `blinkLed()` helper (replaced by `updateLed()`)
+- Replaced individual `LED_BLINK_MS` constant with four granular timing constants (`LED_SIGNAL_ON_MS`, `LED_SIGNAL_OFF_MS`, `LED_SERVO_PULSE_MS`, `LED_SERVO_GAP_MS`)
+- Bumped version string to `v3.0`
 
 ### v2.1
 - Added **onboard LED feedback** (pin 13 / `LED_BUILTIN`)

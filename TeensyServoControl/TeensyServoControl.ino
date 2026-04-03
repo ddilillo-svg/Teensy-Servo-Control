@@ -13,9 +13,16 @@
  *   reverses it when the switch is released.
  * 
  * LED Feedback (onboard LED — Pin 13 / LED_BUILTIN):
- *   - Stays ON continuously after power-up to indicate the board is live.
- *   - Blinks briefly (LED_BLINK_MS milliseconds) each time a servo step is
- *     activated during the deploy or retract sequence.
+ *   - Stays ON solid after power-up to indicate the board is live.
+ *   - Blinks continuously (200 ms ON / 200 ms OFF) while CRSF signal is actively
+ *     being received from the ELRS receiver.
+ *   - Double-blinks (ON 100ms / OFF 100ms / ON 100ms / OFF 300ms, looping) when a
+ *     servo command is active (deploy or retract sequence in progress).
+ *
+ *   Priority (highest → lowest):
+ *     1. Double-blink  — servo sequence is executing
+ *     2. Continuous blink — CRSF signal is present but no sequence running
+ *     3. Solid ON       — board powered, no signal received
  * 
  * Hardware:
  *   - Teensy 3.2
@@ -40,9 +47,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Onboard LED pin (Teensy 3.2 uses pin 13 — same as LED_BUILTIN)
-// LED stays ON at power-up and blinks on every servo activation step.
 #define LED_PIN        LED_BUILTIN   // pin 13 on Teensy 3.2
-#define LED_BLINK_MS   75            // blink duration in milliseconds per activation
+
+// LED blink timings (all in milliseconds)
+#define LED_SIGNAL_ON_MS     200     // continuous blink: ON duration while receiving signal
+#define LED_SIGNAL_OFF_MS    200     // continuous blink: OFF duration while receiving signal
+#define LED_SERVO_PULSE_MS   100     // double-blink: each pulse ON/OFF duration
+#define LED_SERVO_GAP_MS     300     // double-blink: longer gap after second pulse before repeating
+
+// Timeout to consider CRSF signal "lost" if no new frame arrives within this window
+#define CRSF_SIGNAL_TIMEOUT_MS  500  // ms without a frame → signal considered absent
 
 // Serial port connected to the ELRS receiver (UART1 on Teensy 3.2)
 #define CRSF_SERIAL      Serial1
@@ -119,7 +133,7 @@ static const SequenceStep RETRACT_SEQUENCE[] = {
 //  GLOBALS
 // ─────────────────────────────────────────────────────────────────────────────
 
-Servo    servos[NUM_SERVOS];
+Servo      servos[NUM_SERVOS];
 CrsfParser crsf;
 
 // State machine
@@ -130,22 +144,120 @@ enum State {
   STATE_RETRACTING
 };
 
-static State   currentState  = STATE_IDLE;
-static uint8_t seqStep       = 0;
-static uint32_t stepTimer    = 0;
-static bool    lastSwitch    = false;
+static State    currentState  = STATE_IDLE;
+static uint8_t  seqStep       = 0;
+static uint32_t stepTimer     = 0;
+static bool     lastSwitch    = false;
+
+// ── LED state machine ─────────────────────────────────────────────────────────
+//
+//  LED_MODE_SOLID         — board alive, no CRSF signal
+//  LED_MODE_SIGNAL        — continuous blink: CRSF signal present
+//  LED_MODE_SERVO         — double-blink: servo sequence active
+//
+//  Double-blink waveform (repeating):
+//    [ON LED_SERVO_PULSE_MS] [OFF LED_SERVO_PULSE_MS]
+//    [ON LED_SERVO_PULSE_MS] [OFF LED_SERVO_GAP_MS]
+//    ... repeat ...
+//
+//  ledPhase tracks position within each pattern:
+//    Continuous blink: 0 = ON phase, 1 = OFF phase
+//    Double-blink:     0 = pulse1 ON, 1 = pulse1 OFF,
+//                      2 = pulse2 ON, 3 = gap OFF
+
+enum LedMode { LED_MODE_SOLID, LED_MODE_SIGNAL, LED_MODE_SERVO };
+
+static LedMode  ledMode      = LED_MODE_SOLID;
+static uint8_t  ledPhase     = 0;
+static uint32_t ledTimer     = 0;
+static bool     ledState     = true;   // current physical LED output
+
+// CRSF signal-present tracking
+static bool     signalPresent   = false;
+static uint32_t lastFrameMs     = 0;    // millis() when last CRSF frame decoded
+
+// Whether a servo sequence is currently running
+static bool     servoActive     = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  HELPERS
+//  LED HELPERS  (fully non-blocking)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Brief blocking blink — short enough (LED_BLINK_MS ≈ 75 ms) that it does not
-// meaningfully disturb servo hold times (which are 200–500 ms minimum).
-void blinkLed() {
-  digitalWrite(LED_PIN, LOW);         // turn OFF  (was ON from power-up)
-  delay(LED_BLINK_MS);
-  digitalWrite(LED_PIN, HIGH);        // restore ON
+// Call once per loop() to update the LED output.
+// No delay() — advances through phases based on millis().
+void updateLed() {
+  uint32_t now = millis();
+
+  // ── Determine desired mode (priority: servo > signal > solid) ────────────
+  LedMode desired;
+  if (servoActive)        desired = LED_MODE_SERVO;
+  else if (signalPresent) desired = LED_MODE_SIGNAL;
+  else                    desired = LED_MODE_SOLID;
+
+  // ── On mode change: restart phase from beginning ─────────────────────────
+  if (desired != ledMode) {
+    ledMode  = desired;
+    ledPhase = 0;
+    ledTimer = now;
+
+    // Immediately apply first-phase output
+    if (ledMode == LED_MODE_SOLID) {
+      ledState = true;
+    } else {
+      ledState = true;   // all patterns start with LED ON
+    }
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    return;
+  }
+
+  // ── Advance phase within current mode ────────────────────────────────────
+  switch (ledMode) {
+
+    case LED_MODE_SOLID:
+      // Nothing to do — stays HIGH
+      break;
+
+    case LED_MODE_SIGNAL: {
+      // phase 0 = ON  (LED_SIGNAL_ON_MS)
+      // phase 1 = OFF (LED_SIGNAL_OFF_MS)
+      uint32_t duration = (ledPhase == 0) ? LED_SIGNAL_ON_MS : LED_SIGNAL_OFF_MS;
+      if ((now - ledTimer) >= duration) {
+        ledPhase = (ledPhase + 1) % 2;
+        ledState = (ledPhase == 0);          // phase 0 → ON, phase 1 → OFF
+        ledTimer = now;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+      }
+      break;
+    }
+
+    case LED_MODE_SERVO: {
+      // phase 0 = pulse1 ON   (LED_SERVO_PULSE_MS)
+      // phase 1 = pulse1 OFF  (LED_SERVO_PULSE_MS)
+      // phase 2 = pulse2 ON   (LED_SERVO_PULSE_MS)
+      // phase 3 = gap   OFF   (LED_SERVO_GAP_MS)
+      uint32_t duration;
+      switch (ledPhase) {
+        case 0: duration = LED_SERVO_PULSE_MS; break;
+        case 1: duration = LED_SERVO_PULSE_MS; break;
+        case 2: duration = LED_SERVO_PULSE_MS; break;
+        case 3: duration = LED_SERVO_GAP_MS;   break;
+        default: duration = LED_SERVO_PULSE_MS; break;
+      }
+      if ((now - ledTimer) >= duration) {
+        ledPhase = (ledPhase + 1) % 4;
+        // phases 0, 2 → ON;  phases 1, 3 → OFF
+        ledState = (ledPhase == 0 || ledPhase == 2);
+        ledTimer = now;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+      }
+      break;
+    }
+  }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SERVO HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
 
 void attachServos() {
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
@@ -167,7 +279,7 @@ void resetServos() {
 }
 
 // Run one step of a sequence; returns true when the full sequence is complete.
-// Calls blinkLed() each time a servo is activated.
+// The LED is handled entirely by updateLed() — no delay() calls here.
 bool runSequence(const SequenceStep* seq, uint8_t numSteps) {
   if (seqStep >= numSteps) return true;   // already done
 
@@ -176,15 +288,13 @@ bool runSequence(const SequenceStep* seq, uint8_t numSteps) {
   if (seqStep == 0 || (now - stepTimer) >= seq[seqStep - 1].holdMs) {
     // Execute current step
     moveServo(seq[seqStep].servoIndex, seq[seqStep].targetUs);
-    blinkLed();                           // LED blink on servo activation
-    stepTimer = millis();                 // re-sample after blink delay
+    stepTimer = millis();
     seqStep++;
 
     // If this step has zero hold time, immediately chain to next
     if (seq[seqStep - 1].holdMs == 0 && seqStep < numSteps) {
       moveServo(seq[seqStep].servoIndex, seq[seqStep].targetUs);
-      blinkLed();                         // LED blink for chained step too
-      stepTimer = millis();               // re-sample after blink delay
+      stepTimer = millis();
       seqStep++;
     }
   }
@@ -197,9 +307,12 @@ bool runSequence(const SequenceStep* seq, uint8_t numSteps) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void setup() {
-  // Onboard LED — turn ON immediately at power-up
+  // Onboard LED — turn ON immediately at power-up (solid ON = board alive)
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);    // LED ON → board is live
+  digitalWrite(LED_PIN, HIGH);
+  ledState = true;
+  ledMode  = LED_MODE_SOLID;
+  ledTimer = millis();
 
   Serial.begin(115200);           // USB debug serial
   CRSF_SERIAL.begin(CRSF_BAUD);  // ELRS receiver
@@ -207,7 +320,7 @@ void setup() {
   attachServos();
   resetServos();
 
-  Serial.println(F("TeensyServoControl v2.1 — ready"));
+  Serial.println(F("TeensyServoControl v3.0 — ready"));
   Serial.print(F("Servos on pins: "));
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     Serial.print(SERVO_PINS[i]);
@@ -216,11 +329,8 @@ void setup() {
   Serial.println();
   Serial.print(F("Trigger channel: CH"));
   Serial.println(TRIGGER_CHANNEL);
-  Serial.print(F("LED pin: "));
-  Serial.print(LED_PIN);
-  Serial.print(F("  Blink duration: "));
-  Serial.print(LED_BLINK_MS);
-  Serial.println(F(" ms"));
+  Serial.println(F("LED pin: 13"));
+  Serial.println(F("LED modes: solid=powered, blink=signal, double-blink=servo active"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +338,8 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
+  uint32_t now = millis();
+
   // ── Feed incoming bytes into the CRSF parser ──────────────────────────────
   while (CRSF_SERIAL.available()) {
     crsf.feed(CRSF_SERIAL.read());
@@ -236,13 +348,16 @@ void loop() {
   // ── Read channel value once a new frame is available ──────────────────────
   bool switchOn = false;
   if (crsf.hasNewFrame()) {
+    lastFrameMs  = now;                      // mark signal as present
+    signalPresent = true;
+
     uint16_t chVal = crsf.getChannel(TRIGGER_CHANNEL);
     switchOn = (chVal > SWITCH_THRESHOLD);
 
     // Debug (comment out in production to reduce latency)
     static uint32_t dbgTimer = 0;
-    if (millis() - dbgTimer > 200) {
-      dbgTimer = millis();
+    if (now - dbgTimer > 200) {
+      dbgTimer = now;
       Serial.print(F("CH"));
       Serial.print(TRIGGER_CHANNEL);
       Serial.print(F(": "));
@@ -252,41 +367,57 @@ void loop() {
     }
   }
 
+  // ── Signal timeout: mark absent if no frame within CRSF_SIGNAL_TIMEOUT_MS ──
+  if (signalPresent && (now - lastFrameMs) > CRSF_SIGNAL_TIMEOUT_MS) {
+    signalPresent = false;
+  }
+
   // ── State machine ─────────────────────────────────────────────────────────
   switch (currentState) {
 
     case STATE_IDLE:
+      servoActive = false;
       if (switchOn && !lastSwitch) {
         // Rising edge — begin deploy sequence
-        seqStep     = 0;
+        seqStep      = 0;
         currentState = STATE_DEPLOYING;
+        servoActive  = true;
         Serial.println(F("→ DEPLOYING"));
       }
       break;
 
     case STATE_DEPLOYING:
+      servoActive = true;
       if (runSequence(DEPLOY_SEQUENCE, DEPLOY_STEPS)) {
         currentState = STATE_DEPLOYED;
+        servoActive  = false;
         Serial.println(F("→ DEPLOYED"));
       }
       break;
 
     case STATE_DEPLOYED:
+      servoActive = false;
       if (!switchOn && lastSwitch) {
         // Falling edge — begin retract sequence
-        seqStep     = 0;
+        seqStep      = 0;
         currentState = STATE_RETRACTING;
+        servoActive  = true;
         Serial.println(F("→ RETRACTING"));
       }
       break;
 
     case STATE_RETRACTING:
+      servoActive = true;
       if (runSequence(RETRACT_SEQUENCE, RETRACT_STEPS)) {
         currentState = STATE_IDLE;
+        servoActive  = false;
         Serial.println(F("→ IDLE"));
       }
       break;
   }
 
   lastSwitch = switchOn;
+
+  // ── Update LED (non-blocking, runs every loop iteration) ──────────────────
+  updateLed();
 }
