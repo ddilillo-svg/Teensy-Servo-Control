@@ -423,6 +423,7 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 | `SERVO_MIN_US` | `1000` | Servo minimum pulse width (µs) |
 | `SERVO_MAX_US` | `2000` | Servo maximum pulse width (µs) |
 | `SERVO_MID_US` | `1500` | Servo centre/mid pulse width (µs) |
+| `SERVO_DEADBAND_US` | `10` | Ignore commanded position changes smaller than this (µs); prevents jitter from tiny CRSF value fluctuations |
 | `DEPLOY_SEQUENCE[]` | See code | Steps to run when switch goes ON |
 | `RETRACT_SEQUENCE[]` | See code | Steps to run when switch goes OFF |
 | `LED_PIN` | `LED_BUILTIN` (pin 13) | Onboard LED pin — do not change for Teensy 3.2 |

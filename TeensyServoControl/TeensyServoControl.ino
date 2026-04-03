@@ -103,6 +103,10 @@ static const uint8_t SERVO_PINS[] = { 3, 4, 5, 6, 9, 10, 20, 21, 22 };
 #define SERVO_MAX_US   2000
 #define SERVO_MID_US   1500
 
+// Servo deadband: ignore commanded position changes smaller than this (µs).
+// Prevents servo jitter caused by tiny CRSF value fluctuations.
+#define SERVO_DEADBAND_US  10
+
 // Sequence step definition
 struct SequenceStep {
   uint8_t  servoIndex;   // index into SERVO_PINS[]
