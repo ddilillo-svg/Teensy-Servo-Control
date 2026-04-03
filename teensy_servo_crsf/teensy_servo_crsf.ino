@@ -19,15 +19,19 @@
  *     SWITCH_CHANNEL   – which CRSF channel carries your switch (1-16)
  *     SWITCH_MID       – mid-point threshold between low/high (CRSF range ≈ 172-1811)
  *     SERVO_PINS[]     – output pin for each of the 9 servos
- *     SERVO_START_US[] – servo position (µs) BEFORE trigger
- *     SERVO_END_US[]   – servo position (µs) AFTER trigger
+ *     SERVO_START_US[] – servo position (µs) when closed/default (start & reset)
+ *     SERVO_END_US[]   – servo position (µs) when open/triggered
  *
- * Behavior:
- *   Every time the switch transitions LOW→HIGH, the next servo in the
- *   sequence (0-8) moves from its START position to its END position.
- *   The index wraps: after servo 8, it resets to servo 0.
- *   Switching back HIGH→LOW does NOT reverse the move; a second toggle
- *   advances to the next servo.
+ * Behavior — Strict Sequential Mode:
+ *   Flip 1  → Servo 1 moves to its END (open) position
+ *   Flip 2  → Servo 2 moves to its END (open) position
+ *   ...
+ *   Flip 9  → Servo 9 moves to its END (open) position
+ *   Flip 10 → ALL 9 servos return to their START (closed/default) position
+ *             and the sequence resets to Servo 1.
+ *
+ *   Only ONE servo moves per switch flip. Switching back HIGH→LOW does NOT
+ *   trigger any action; only the next LOW→HIGH rising edge does.
  *
  * Author : Jordan Temkin <399project@gmail.com>
  * Board  : Teensy 3.2 (select in Arduino IDE: Tools → Board → Teensy 3.2)
@@ -71,30 +75,31 @@ const uint8_t SERVO_PINS[NUM_SERVOS] = {
 // Standard range: 1000 µs (full left/down) … 1500 µs (center) … 2000 µs (full right/up)
 // Adjust per servo mechanical travel.
 
-// Position each servo sits at on startup / before it's triggered
+// Closed / default position — where each servo sits on startup and after the
+// "all close" reset (10th flip).
 const uint16_t SERVO_START_US[NUM_SERVOS] = {
-  1000,  // Servo 1 start
-  1000,  // Servo 2 start
-  1000,  // Servo 3 start
-  1000,  // Servo 4 start
-  1000,  // Servo 5 start
-  1000,  // Servo 6 start
-  1000,  // Servo 7 start
-  1000,  // Servo 8 start
-  1000   // Servo 9 start
+  1000,  // Servo 1 closed
+  1000,  // Servo 2 closed
+  1000,  // Servo 3 closed
+  1000,  // Servo 4 closed
+  1000,  // Servo 5 closed
+  1000,  // Servo 6 closed
+  1000,  // Servo 7 closed
+  1000,  // Servo 8 closed
+  1000   // Servo 9 closed
 };
 
-// Position each servo moves TO when triggered
+// Open / triggered position — where each servo moves when it is activated.
 const uint16_t SERVO_END_US[NUM_SERVOS] = {
-  2000,  // Servo 1 end
-  2000,  // Servo 2 end
-  2000,  // Servo 3 end
-  2000,  // Servo 4 end
-  2000,  // Servo 5 end
-  2000,  // Servo 6 end
-  2000,  // Servo 7 end
-  2000,  // Servo 8 end
-  2000   // Servo 9 end
+  2000,  // Servo 1 open
+  2000,  // Servo 2 open
+  2000,  // Servo 3 open
+  2000,  // Servo 4 open
+  2000,  // Servo 5 open
+  2000,  // Servo 6 open
+  2000,  // Servo 7 open
+  2000,  // Servo 8 open
+  2000   // Servo 9 open
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,15 +111,19 @@ CrsfSerial crsf(Serial1, CRSF_BAUDRATE);
 
 Servo servos[NUM_SERVOS];
 
-// Track which servo fires next (0-based index into SERVO_PINS[])
-uint8_t  sequenceIndex = 0;
+// ── Sequence state ───────────────────────────────────────────────────────────
+// flipCount tracks how many LOW→HIGH rising edges have occurred this cycle.
+//   flipCount 1-9  → activate servo (flipCount - 1)
+//   flipCount 10   → close all servos and reset to 0
+uint8_t flipCount = 0;
 
 // Debounce / edge-detection state for the switch channel
-bool     switchWasHigh = false;
+bool switchWasHigh = false;
 
 // ── Forward declarations ─────────────────────────────────────────────────────
 void onChannelPacket();
-void triggerNextServo();
+void activateServo(uint8_t idx);
+void closeAllServos();
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,7 +133,7 @@ void setup()
   Serial.begin(115200);
   Serial.println(F("Teensy 3.2  |  9-Servo CRSF Sequencer  |  Booting..."));
 
-  // Attach all servos and move them to their start positions
+  // Attach all servos and move them to their closed/start positions
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     servos[i].attach(SERVO_PINS[i]);
     servos[i].writeMicroseconds(SERVO_START_US[i]);
@@ -132,7 +141,7 @@ void setup()
     Serial.print(i + 1);
     Serial.print(F(" → pin "));
     Serial.print(SERVO_PINS[i]);
-    Serial.print(F("  start="));
+    Serial.print(F("  closed="));
     Serial.print(SERVO_START_US[i]);
     Serial.println(F(" µs"));
   }
@@ -146,7 +155,9 @@ void setup()
   Serial.println(F(" baud"));
   Serial.print(F("Trigger channel: "));
   Serial.println(SWITCH_CHANNEL);
-  Serial.println(F("Ready."));
+  Serial.println(F("Ready. Waiting for switch flips..."));
+  Serial.println(F("  Flips 1-9 : activate Servo 1 through 9 sequentially"));
+  Serial.println(F("  Flip 10   : close all servos and reset sequence"));
 }
 
 
@@ -167,8 +178,15 @@ void loop()
  * Called by CrsfSerial each time a full CRSF channel frame is decoded
  * (typically ~150 Hz with ELRS in 150 Hz mode, or ~50 Hz in 50 Hz mode).
  *
- * Reads the configured switch channel and fires triggerNextServo() on
- * every rising edge (LOW → HIGH transition).
+ * Reads the configured switch channel and advances the sequence on every
+ * rising edge (LOW → HIGH transition).
+ *
+ * Sequence rules:
+ *   Flip 1  → Servo 1 activates
+ *   Flip 2  → Servo 2 activates
+ *   ...
+ *   Flip 9  → Servo 9 activates
+ *   Flip 10 → All servos close, sequence resets to Flip 1
  */
 void onChannelPacket()
 {
@@ -178,7 +196,16 @@ void onChannelPacket()
 
   // Detect rising edge only (LOW → HIGH)
   if (switchIsHigh && !switchWasHigh) {
-    triggerNextServo();
+    flipCount++;
+
+    if (flipCount <= NUM_SERVOS) {
+      // Flips 1-9: activate the corresponding servo (strictly one at a time)
+      activateServo(flipCount - 1);   // convert 1-based flip to 0-based index
+    } else {
+      // Flip 10: close all servos and reset the cycle
+      closeAllServos();
+      flipCount = 0;
+    }
   }
 
   switchWasHigh = switchIsHigh;
@@ -187,24 +214,44 @@ void onChannelPacket()
 
 // ─────────────────────────────────────────────────────────────────────────────
 /**
- * triggerNextServo()
- * Advances the sequence index and moves the next servo to its end position.
- * After the last servo (index 8), the index wraps back to 0.
+ * activateServo(idx)
+ * Moves a single servo (by 0-based index) to its open/triggered END position.
+ * No other servo is touched.
  */
-void triggerNextServo()
+void activateServo(uint8_t idx)
 {
-  uint8_t idx = sequenceIndex;
-
-  Serial.print(F("Trigger → Servo "));
+  Serial.print(F("Flip "));
+  Serial.print(flipCount);
+  Serial.print(F(" → Servo "));
   Serial.print(idx + 1);
   Serial.print(F("  (pin "));
   Serial.print(SERVO_PINS[idx]);
-  Serial.print(F(")  → "));
+  Serial.print(F(")  OPEN → "));
   Serial.print(SERVO_END_US[idx]);
   Serial.println(F(" µs"));
 
   servos[idx].writeMicroseconds(SERVO_END_US[idx]);
+}
 
-  // Advance and wrap the index
-  sequenceIndex = (sequenceIndex + 1) % NUM_SERVOS;
+
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * closeAllServos()
+ * Returns ALL 9 servos to their closed/default (START) positions.
+ * Called on the 10th switch flip. Resets the sequence back to Servo 1.
+ */
+void closeAllServos()
+{
+  Serial.println(F("Flip 10 → CLOSE ALL servos — sequence reset"));
+
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    servos[i].writeMicroseconds(SERVO_START_US[i]);
+    Serial.print(F("  Servo "));
+    Serial.print(i + 1);
+    Serial.print(F(" CLOSED → "));
+    Serial.print(SERVO_START_US[i]);
+    Serial.println(F(" µs"));
+  }
+
+  Serial.println(F("All servos closed. Ready for next cycle (Flip 1 = Servo 1)."));
 }

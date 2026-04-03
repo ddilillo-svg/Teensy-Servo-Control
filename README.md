@@ -91,23 +91,39 @@ Change any pin to any free Teensy 3.2 digital pin.
 ### Servo positions
 
 ```cpp
-const uint16_t SERVO_START_US[NUM_SERVOS] = { 1000, 1000, ... };  // rest position
-const uint16_t SERVO_END_US[NUM_SERVOS]   = { 2000, 2000, ... };  // triggered position
+const uint16_t SERVO_START_US[NUM_SERVOS] = { 1000, 1000, ... };  // closed / default position
+const uint16_t SERVO_END_US[NUM_SERVOS]   = { 2000, 2000, ... };  // open / triggered position
 ```
 
 Values are in **microseconds**. Standard range: `1000` (full CCW/down) –
 `1500` (center) – `2000` (full CW/up). Tune per-servo to match your
 mechanical setup.
 
+`SERVO_START_US` is also the position all servos return to on the 10th flip
+(the "all close" reset).
+
 ---
 
-## Behavior
+## Behavior — Strict Sequential Mode
 
-1. On power-up all servos move to their `SERVO_START_US` positions.
-2. Each **rising edge** of the configured switch channel (LOW → HIGH) fires
-   the next servo in sequence.
-3. Sequence order: Servo 1 → Servo 2 → … → Servo 9 → Servo 1 → …
-4. Triggered servos move to their `SERVO_END_US` position and **hold there**.
+| Switch Flip | Action |
+|-------------|--------|
+| Flip 1 | Servo 1 moves to its **open** (`SERVO_END_US`) position |
+| Flip 2 | Servo 2 moves to its **open** position |
+| Flip 3 | Servo 3 moves to its **open** position |
+| … | … |
+| Flip 9 | Servo 9 moves to its **open** position |
+| **Flip 10** | **All 9 servos return to their closed/default (`SERVO_START_US`) position — sequence resets to Flip 1** |
+
+Key rules:
+
+1. On power-up all servos move to their `SERVO_START_US` (closed/default) positions.
+2. Each **rising edge** of the configured switch channel (LOW → HIGH) advances
+   the sequence by **exactly one step**.
+3. **Only one servo moves per flip** — there is no simultaneous or chained movement
+   during flips 1–9.
+4. After the 9th servo has been opened, the **10th flip closes all 9 servos at once**
+   and resets the counter so the next flip starts again at Servo 1.
 5. Switching back (HIGH → LOW) does **not** move any servo — only the next
    rising edge does.
 6. Debug output streams over USB serial at 115 200 baud (open the Serial
