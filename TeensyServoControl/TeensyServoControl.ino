@@ -11,12 +11,10 @@
  *   connected to Teensy 3.2 UART1.  When a designated switch channel crosses a
  *   configurable threshold the firmware runs a multi-step servo sequence, then
  *   reverses it when the switch is released.
- *
- *   Servo Deadband:
- *   Each servo's last-written position is tracked in servoPositionUs[].  Before
- *   issuing a new writeMicroseconds() command the firmware checks whether the
- *   target is within SERVO_DEADBAND_US of the current position.  If so the write
- *   is skipped, preventing continuous micro-adjustments and reducing jitter.
+ * 
+ *   A hardware safety switch on CH6 must be in the ARMED position before any
+ *   servo movement can be triggered.  When CH6 is in the SAFE position the
+ *   firmware ignores all CH5 input and no sequences can start.
  * 
  * LED Feedback (onboard LED — Pin 13 / LED_BUILTIN):
  *   - Stays ON solid after power-up to indicate the board is live.
@@ -34,6 +32,7 @@
  *   - Teensy 3.2
  *   - ELRS receiver (e.g. BetaFPV ELRS Nano / Happymodel EP1/EP2)
  *   - 9 servos wired to SERVO_PINS[]
+ *   - Safety switch wired to CH6 on the RC transmitter
  * 
  * Wiring:
  *   ELRS RX TX-pin  →  Teensy Pin 0  (Serial1 RX)
@@ -68,13 +67,29 @@
 #define CRSF_SERIAL      Serial1
 #define CRSF_BAUD        420000          // standard CRSF baud rate
 
-// CRSF channel that acts as the trigger switch (1-indexed, 1 = CH1)
-// Typical RC mapping: CH5 = AUX1 (first aux switch)
+// ── TRIGGER CHANNEL (CH5 / AUX1) ─────────────────────────────────────────────
+// CRSF channel that controls the servo deploy/retract sequence (1-indexed).
+// Typical RC mapping: CH5 = AUX1 (first aux switch).
 #define TRIGGER_CHANNEL  5
 
 // Switch threshold: channel value above this = "switch ON"
 // CRSF channel range is 172–1811, midpoint ≈ 992
 #define SWITCH_THRESHOLD 1200
+
+// ── SAFETY CHANNEL (CH6 / AUX2) ──────────────────────────────────────────────
+// CRSF channel that acts as a hardware safety interlock (1-indexed).
+// The firmware will not allow any servo movement unless this channel is in the
+// ARMED position (above SAFETY_THRESHOLD).
+//
+//   CH6 ≤ SAFETY_THRESHOLD  →  SAFE  (no servo movement permitted)
+//   CH6 > SAFETY_THRESHOLD  →  ARMED (CH5 trigger is active)
+//
+// Wire a dedicated 2-position or 3-position switch to AUX2 on your transmitter
+// and configure it to output ~1000 µs (safe) and ~2000 µs (armed).
+// For a 3-position switch set SAFETY_THRESHOLD = 1600 so only the full-up
+// position arms the system.
+#define SAFETY_CHANNEL   6
+#define SAFETY_THRESHOLD 1500        // channel value that must be exceeded to ARM
 
 // Servo output pins on Teensy 3.2
 // Hardware PWM-capable pins: 3, 4, 5, 6, 9, 10, 20, 21, 22, 23, 25, 32
@@ -87,11 +102,6 @@ static const uint8_t SERVO_PINS[] = { 3, 4, 5, 6, 9, 10, 20, 21, 22 };
 #define SERVO_MIN_US   1000
 #define SERVO_MAX_US   2000
 #define SERVO_MID_US   1500
-
-// Servo deadband (microseconds)
-// If the target position is within this many µs of the current position,
-// the write() command is suppressed to prevent jitter and micro-adjustments.
-#define SERVO_DEADBAND_US  100
 
 // Sequence step definition
 struct SequenceStep {
@@ -147,10 +157,6 @@ static const SequenceStep RETRACT_SEQUENCE[] = {
 Servo      servos[NUM_SERVOS];
 CrsfParser crsf;
 
-// Tracks the last position written to each servo (µs).
-// Initialised to SERVO_MIN_US (the startup reset position).
-static uint16_t servoPositionUs[NUM_SERVOS];
-
 // State machine
 enum State {
   STATE_IDLE,
@@ -163,6 +169,11 @@ static State    currentState  = STATE_IDLE;
 static uint8_t  seqStep       = 0;
 static uint32_t stepTimer     = 0;
 static bool     lastSwitch    = false;
+
+// ── Safety interlock ──────────────────────────────────────────────────────────
+// systemArmed: true when CH6 > SAFETY_THRESHOLD.
+// When false, CH5 input is completely ignored — no sequences can start.
+static bool     systemArmed   = false;
 
 // ── LED state machine ─────────────────────────────────────────────────────────
 //
@@ -280,29 +291,16 @@ void attachServos() {
   }
 }
 
-// Move a servo to the target position (µs).
-// If the target is within SERVO_DEADBAND_US of the current position the command
-// is suppressed, preventing jitter from repeated tiny adjustments.
 void moveServo(uint8_t idx, uint16_t us) {
-  if (idx >= NUM_SERVOS) return;
-
-  uint16_t current = servoPositionUs[idx];
-  uint16_t delta   = (us > current) ? (us - current) : (current - us);
-
-  if (delta <= SERVO_DEADBAND_US) {
-    // Within deadband — skip the write to avoid servo jitter
-    return;
+  if (idx < NUM_SERVOS) {
+    servos[idx].writeMicroseconds(us);
   }
-
-  servos[idx].writeMicroseconds(us);
-  servoPositionUs[idx] = us;
 }
 
 // Drive all servos to a safe rest position
 void resetServos() {
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     servos[i].writeMicroseconds(SERVO_MIN_US);
-    servoPositionUs[i] = SERVO_MIN_US;
   }
 }
 
@@ -348,7 +346,7 @@ void setup() {
   attachServos();
   resetServos();
 
-  Serial.println(F("TeensyServoControl v3.1 — ready"));
+  Serial.println(F("TeensyServoControl v4.0 — ready"));
   Serial.print(F("Servos on pins: "));
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     Serial.print(SERVO_PINS[i]);
@@ -357,8 +355,13 @@ void setup() {
   Serial.println();
   Serial.print(F("Trigger channel: CH"));
   Serial.println(TRIGGER_CHANNEL);
+  Serial.print(F("Safety channel:  CH"));
+  Serial.print(SAFETY_CHANNEL);
+  Serial.print(F("  threshold: "));
+  Serial.println(SAFETY_THRESHOLD);
   Serial.println(F("LED pin: 13"));
   Serial.println(F("LED modes: solid=powered, blink=signal, double-blink=servo active"));
+  Serial.println(F("Safety: SAFE (waiting for CH6 ARM)"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -373,25 +376,46 @@ void loop() {
     crsf.feed(CRSF_SERIAL.read());
   }
 
-  // ── Read channel value once a new frame is available ──────────────────────
+  // ── Read channel values once a new frame is available ─────────────────────
   bool switchOn = false;
   if (crsf.hasNewFrame()) {
     lastFrameMs  = now;                      // mark signal as present
     signalPresent = true;
 
-    uint16_t chVal = crsf.getChannel(TRIGGER_CHANNEL);
-    switchOn = (chVal > SWITCH_THRESHOLD);
+    // ── CH6 SAFETY INTERLOCK ────────────────────────────────────────────────
+    // Evaluate before CH5 — safety state always reflects the latest frame.
+    uint16_t safetyVal = crsf.getChannel(SAFETY_CHANNEL);
+    bool prevArmed     = systemArmed;
+    systemArmed        = (safetyVal > SAFETY_THRESHOLD);
 
-    // Debug (comment out in production to reduce latency)
-    static uint32_t dbgTimer = 0;
-    if (now - dbgTimer > 200) {
-      dbgTimer = now;
+    // Debug safety transitions
+    if (systemArmed != prevArmed) {
       Serial.print(F("CH"));
-      Serial.print(TRIGGER_CHANNEL);
+      Serial.print(SAFETY_CHANNEL);
       Serial.print(F(": "));
-      Serial.print(chVal);
-      Serial.print(F("  Switch: "));
-      Serial.println(switchOn ? F("ON") : F("OFF"));
+      Serial.print(safetyVal);
+      Serial.println(systemArmed ? F("  Safety: ARMED") : F("  Safety: SAFE"));
+    }
+
+    // ── CH5 TRIGGER ─────────────────────────────────────────────────────────
+    // Only read the trigger channel when the safety is armed.
+    // If safety is in SAFE position, treat the switch as OFF regardless of
+    // its physical position — this prevents any sequence from starting.
+    if (systemArmed) {
+      uint16_t chVal = crsf.getChannel(TRIGGER_CHANNEL);
+      switchOn = (chVal > SWITCH_THRESHOLD);
+
+      // Debug (comment out in production to reduce latency)
+      static uint32_t dbgTimer = 0;
+      if (now - dbgTimer > 200) {
+        dbgTimer = now;
+        Serial.print(F("CH"));
+        Serial.print(TRIGGER_CHANNEL);
+        Serial.print(F(": "));
+        Serial.print(chVal);
+        Serial.print(F("  Switch: "));
+        Serial.println(switchOn ? F("ON") : F("OFF"));
+      }
     }
   }
 
@@ -400,13 +424,24 @@ void loop() {
     signalPresent = false;
   }
 
+  // ── Safety interlock: if not armed, suppress trigger and hold in IDLE ─────
+  // If the system was disarmed while a sequence was running, that sequence
+  // is allowed to complete naturally (failsafe: let mechanism settle).
+  // New sequences cannot start until the system is re-armed.
+  if (!systemArmed) {
+    // Treat trigger switch as permanently OFF when safety is engaged.
+    // This prevents rising-edge detection from firing in STATE_IDLE.
+    switchOn   = false;
+    lastSwitch = false;  // also clear the edge-detection latch
+  }
+
   // ── State machine ─────────────────────────────────────────────────────────
   switch (currentState) {
 
     case STATE_IDLE:
       servoActive = false;
       if (switchOn && !lastSwitch) {
-        // Rising edge — begin deploy sequence
+        // Rising edge — begin deploy sequence (only reachable when systemArmed)
         seqStep      = 0;
         currentState = STATE_DEPLOYING;
         servoActive  = true;
