@@ -15,8 +15,9 @@ A compact, reliable firmware for the [Teensy 3.2](https://www.pjrc.com/store/tee
    - [Libraries Used](#41-libraries-used)
    - [CRSF Parsing](#42-crsf-parsing)
    - [Servo Control Logic](#43-servo-control-logic)
-   - [Sequence Steps](#44-sequence-steps)
-   - [LED Feedback](#45-led-feedback)
+   - [Servo Deadband](#44-servo-deadband)
+   - [Sequence Steps](#45-sequence-steps)
+   - [LED Feedback](#46-led-feedback)
 5. [Setup & Upload Instructions](#5-setup--upload-instructions)
 6. [Configuration Options](#6-configuration-options)
 7. [Serial Debug Output](#7-serial-debug-output)
@@ -156,6 +157,8 @@ Channel values are in the CRSF native range **172–1811** (midpoint ≈ 992). U
 
 Servos are driven by the standard Teensyduino `Servo` library using `writeMicroseconds()` for precise, sub-millisecond resolution.
 
+Each servo's last-written position is tracked in `servoPositionUs[]`. Before any `writeMicroseconds()` call, the firmware computes the distance between the current and target positions and applies the [servo deadband](#44-servo-deadband) check.
+
 The firmware uses a **non-blocking state machine** with four states:
 
 | State | Description |
@@ -169,7 +172,51 @@ The firmware uses a **non-blocking state machine** with four states:
 
 **Non-blocking timing** — `millis()` is used instead of `delay()`, so the CRSF parser continues to receive bytes even during sequence execution.
 
-### 4.5 LED Feedback
+### 4.4 Servo Deadband
+
+The **servo deadband** prevents continuous micro-adjustments that cause servo jitter, heat, and unnecessary current draw.
+
+#### How It Works
+
+Every servo's most recently commanded position is stored in the `servoPositionUs[]` array (one entry per servo, initialised to `SERVO_MIN_US` at startup). Before sending a new `writeMicroseconds()` command the firmware computes the absolute distance between the current stored position and the new target:
+
+```
+delta = |targetUs - currentUs|
+```
+
+If `delta ≤ SERVO_DEADBAND_US` the write is **suppressed** — no PWM update is sent to the servo hardware and `servoPositionUs[]` is left unchanged. If `delta > SERVO_DEADBAND_US` the write proceeds normally and `servoPositionUs[]` is updated to the new target.
+
+```cpp
+void moveServo(uint8_t idx, uint16_t us) {
+  if (idx >= NUM_SERVOS) return;
+
+  uint16_t current = servoPositionUs[idx];
+  uint16_t delta   = (us > current) ? (us - current) : (current - us);
+
+  if (delta <= SERVO_DEADBAND_US) {
+    return;  // within deadband — skip write to suppress jitter
+  }
+
+  servos[idx].writeMicroseconds(us);
+  servoPositionUs[idx] = us;
+}
+```
+
+#### Configurable Parameter
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `SERVO_DEADBAND_US` | `100` | Minimum position change (µs) required to issue a new servo write |
+
+The default of **100 µs** (10% of the full 1000–2000 µs range) is a conservative value that eliminates jitter from repeated identical or near-identical commands without sacrificing meaningful travel resolution. Reduce it if finer positioning accuracy is required; increase it if servos still buzz between sequence steps.
+
+#### Why This Matters
+
+In a multi-step sequence the same servo index can appear in several consecutive steps (e.g. servo 0 is moved to `SERVO_MAX_US` in step 1 and then to `SERVO_MID_US` in the final latching step). Without deadband logic, if the state machine were to revisit a step due to a timing edge case the servo would receive redundant writes and hunt around its target, drawing current and causing mechanical wear. The deadband makes every step **idempotent** — running it twice has the same effect as running it once.
+
+---
+
+### 4.6 LED Feedback
 
 The onboard LED (pin 13 / `LED_BUILTIN`) provides three distinct visual states.  
 All LED transitions are **fully non-blocking** — implemented as a state machine driven by `millis()` with no `delay()` calls. This ensures servo timing and CRSF communication are never interrupted by LED updates.
@@ -241,7 +288,7 @@ if (signalPresent && (millis() - lastFrameMs) > CRSF_SIGNAL_TIMEOUT_MS) {
 
 ---
 
-### 4.4 Sequence Steps
+### 4.5 Sequence Steps
 
 Each step in a sequence specifies:
 
@@ -339,6 +386,7 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 | `SERVO_MIN_US` | `1000` | Servo minimum pulse width (µs) |
 | `SERVO_MAX_US` | `2000` | Servo maximum pulse width (µs) |
 | `SERVO_MID_US` | `1500` | Servo centre/mid pulse width (µs) |
+| `SERVO_DEADBAND_US` | `100` | Minimum µs change to issue a new servo write (deadband range) |
 | `DEPLOY_SEQUENCE[]` | See code | Steps to run when switch goes ON |
 | `RETRACT_SEQUENCE[]` | See code | Steps to run when switch goes OFF |
 | `LED_PIN` | `LED_BUILTIN` (pin 13) | Onboard LED pin — do not change for Teensy 3.2 |
@@ -412,6 +460,7 @@ To reduce serial overhead in production, comment out the debug block inside the 
 | Upload fails | Teensy not in bootloader mode | Press the button on the Teensy or check USB connection |
 | `crsf_parser.h` not found | File not in same folder as `.ino` | Both files must be inside `TeensyServoControl/` folder |
 | Servos jitter or draw excess current | All 9 servos from same BEC | Ensure BEC is rated for the combined stall current (≥9 A recommended) |
+| Servo doesn’t move to a new target | Target is within deadband of current position | Adjust `SERVO_DEADBAND_US` downward, or verify the sequence step target differs by more than 100 µs from the prior position |
 | LED stays solid, won't blink | No CRSF signal received | Check receiver wiring/binding; LED blinks only when frames arrive |
 | LED blinks but double-blink never shows | Switch threshold not crossed | Verify `TRIGGER_CHANNEL` and `SWITCH_THRESHOLD` settings |
 
@@ -425,6 +474,13 @@ MIT License — free to use, modify, and distribute.
 ---
 
 ## Changelog
+
+### v3.1
+- **Added servo deadband** (`SERVO_DEADBAND_US = 100` µs) — `moveServo()` now suppresses `writeMicroseconds()` calls when the target is within the deadband of the current position.
+- Added `servoPositionUs[]` array to track the last-written position for each servo.
+- `resetServos()` initialises `servoPositionUs[]` to `SERVO_MIN_US` on startup.
+- Updated README with [Servo Deadband](#44-servo-deadband) section, updated Configuration Options table, and new Troubleshooting entry.
+- Bumped version string to `v3.1`.
 
 ### v3.0
 - **Revised LED feedback** — three distinct non-blocking LED states:

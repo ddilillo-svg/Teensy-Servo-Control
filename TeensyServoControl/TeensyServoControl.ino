@@ -11,6 +11,12 @@
  *   connected to Teensy 3.2 UART1.  When a designated switch channel crosses a
  *   configurable threshold the firmware runs a multi-step servo sequence, then
  *   reverses it when the switch is released.
+ *
+ *   Servo Deadband:
+ *   Each servo's last-written position is tracked in servoPositionUs[].  Before
+ *   issuing a new writeMicroseconds() command the firmware checks whether the
+ *   target is within SERVO_DEADBAND_US of the current position.  If so the write
+ *   is skipped, preventing continuous micro-adjustments and reducing jitter.
  * 
  * LED Feedback (onboard LED — Pin 13 / LED_BUILTIN):
  *   - Stays ON solid after power-up to indicate the board is live.
@@ -82,6 +88,11 @@ static const uint8_t SERVO_PINS[] = { 3, 4, 5, 6, 9, 10, 20, 21, 22 };
 #define SERVO_MAX_US   2000
 #define SERVO_MID_US   1500
 
+// Servo deadband (microseconds)
+// If the target position is within this many µs of the current position,
+// the write() command is suppressed to prevent jitter and micro-adjustments.
+#define SERVO_DEADBAND_US  100
+
 // Sequence step definition
 struct SequenceStep {
   uint8_t  servoIndex;   // index into SERVO_PINS[]
@@ -135,6 +146,10 @@ static const SequenceStep RETRACT_SEQUENCE[] = {
 
 Servo      servos[NUM_SERVOS];
 CrsfParser crsf;
+
+// Tracks the last position written to each servo (µs).
+// Initialised to SERVO_MIN_US (the startup reset position).
+static uint16_t servoPositionUs[NUM_SERVOS];
 
 // State machine
 enum State {
@@ -265,16 +280,29 @@ void attachServos() {
   }
 }
 
+// Move a servo to the target position (µs).
+// If the target is within SERVO_DEADBAND_US of the current position the command
+// is suppressed, preventing jitter from repeated tiny adjustments.
 void moveServo(uint8_t idx, uint16_t us) {
-  if (idx < NUM_SERVOS) {
-    servos[idx].writeMicroseconds(us);
+  if (idx >= NUM_SERVOS) return;
+
+  uint16_t current = servoPositionUs[idx];
+  uint16_t delta   = (us > current) ? (us - current) : (current - us);
+
+  if (delta <= SERVO_DEADBAND_US) {
+    // Within deadband — skip the write to avoid servo jitter
+    return;
   }
+
+  servos[idx].writeMicroseconds(us);
+  servoPositionUs[idx] = us;
 }
 
 // Drive all servos to a safe rest position
 void resetServos() {
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     servos[i].writeMicroseconds(SERVO_MIN_US);
+    servoPositionUs[i] = SERVO_MIN_US;
   }
 }
 
@@ -320,7 +348,7 @@ void setup() {
   attachServos();
   resetServos();
 
-  Serial.println(F("TeensyServoControl v3.0 — ready"));
+  Serial.println(F("TeensyServoControl v3.1 — ready"));
   Serial.print(F("Servos on pins: "));
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     Serial.print(SERVO_PINS[i]);
