@@ -16,6 +16,7 @@ A compact, reliable firmware for the [Teensy 3.2](https://www.pjrc.com/store/tee
    - [CRSF Parsing](#42-crsf-parsing)
    - [Servo Control Logic](#43-servo-control-logic)
    - [Sequence Steps](#44-sequence-steps)
+   - [LED Feedback](#45-led-feedback)
 5. [Setup & Upload Instructions](#5-setup--upload-instructions)
 6. [Configuration Options](#6-configuration-options)
 7. [Serial Debug Output](#7-serial-debug-output)
@@ -35,6 +36,7 @@ This project was built for Project 399 to remotely actuate a mechanical servo-dr
 - When the switch crosses a threshold (ON): executes a **deploy sequence** — moving each of the 9 servos to their target positions in a defined order with configurable hold times between steps.
 - When the switch returns low (OFF): executes a **retract sequence** in reverse.
 - State machine prevents mid-sequence interruption and ensures clean transitions.
+- **Onboard LED (Pin 13)** stays ON at power-up and blinks on every servo activation step.
 
 **Why Teensy 3.2?**
 
@@ -167,6 +169,45 @@ The firmware uses a **non-blocking state machine** with four states:
 
 **Non-blocking timing** — `millis()` is used instead of `delay()`, so the CRSF parser continues to receive bytes even during sequence execution.
 
+### 4.5 LED Feedback
+
+The onboard LED (pin 13 / `LED_BUILTIN`) provides two visual status indicators:
+
+| Behavior | Meaning |
+|----------|--------|
+| **LED ON solid** | Board powered up and firmware running |
+| **LED blinks briefly** | A servo step was just activated (deploy or retract) |
+
+**Implementation:**
+
+```cpp
+#define LED_PIN      LED_BUILTIN   // pin 13 on Teensy 3.2
+#define LED_BLINK_MS 75            // blink duration in ms
+```
+
+In `setup()`, the LED is configured as an output and driven HIGH immediately:
+
+```cpp
+pinMode(LED_PIN, OUTPUT);
+digitalWrite(LED_PIN, HIGH);    // LED ON → board is live
+```
+
+Each time a servo step fires inside `runSequence()`, `blinkLed()` is called:
+
+```cpp
+void blinkLed() {
+  digitalWrite(LED_PIN, LOW);    // momentary OFF
+  delay(LED_BLINK_MS);           // 75 ms
+  digitalWrite(LED_PIN, HIGH);   // restore ON
+}
+```
+
+The blink is a short blocking delay (75 ms by default). Since all sequence hold times are ≥ 200 ms, this does **not** meaningfully impact servo timing. To change the blink duration, adjust `LED_BLINK_MS` in the configuration section at the top of `TeensyServoControl.ino`.
+
+For a full 9-servo deploy sequence you will see **up to 11 blinks** (10 deploy steps + chained simultaneous pairs counted individually).
+
+---
+
 ### 4.4 Sequence Steps
 
 Each step in a sequence specifies:
@@ -234,13 +275,16 @@ Step 10: Servo 0 → 1500 µs (latch/mid)   | hold 200 ms
 Open `Tools → Serial Monitor` at **115200 baud**. You should see:
 
 ```
-TeensyServoControl v2.0 — ready
+TeensyServoControl v2.1 — ready
 Servos on pins: 3, 4, 5, 6, 9, 10, 20, 21, 22
 Trigger channel: CH5
+LED pin: 13  Blink duration: 75 ms
 CH5: 172  Switch: OFF
 CH5: 172  Switch: OFF
 …
 ```
+
+The onboard LED (pin 13) will be **ON solid** as soon as the board boots. Each time you trigger the sequence, it will **blink once per servo step** as the sequence executes.
 
 ---
 
@@ -260,6 +304,8 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 | `SERVO_MID_US` | `1500` | Servo centre/mid pulse width (µs) |
 | `DEPLOY_SEQUENCE[]` | See code | Steps to run when switch goes ON |
 | `RETRACT_SEQUENCE[]` | See code | Steps to run when switch goes OFF |
+| `LED_PIN` | `LED_BUILTIN` (pin 13) | Onboard LED pin — do not change for Teensy 3.2 |
+| `LED_BLINK_MS` | `75` | LED blink duration in milliseconds per servo activation |
 
 ### Changing the trigger channel
 
@@ -334,6 +380,15 @@ MIT License — free to use, modify, and distribute.
 ---
 
 ## Changelog
+
+### v2.1
+- Added **onboard LED feedback** (pin 13 / `LED_BUILTIN`)
+  - LED turns ON solid at power-up (board-alive indicator)
+  - LED blinks briefly (`LED_BLINK_MS` = 75 ms) on every servo activation step
+- Added `blinkLed()` helper; `LED_PIN` and `LED_BLINK_MS` are configurable constants
+- `stepTimer` re-sampled with `millis()` after each blink to preserve hold-time accuracy
+- Startup serial output now prints LED pin and blink duration
+- Bumped version string to `v2.1`
 
 ### v2.0
 - Expanded from 4 to **9 servos**

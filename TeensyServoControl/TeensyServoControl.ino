@@ -12,6 +12,11 @@
  *   configurable threshold the firmware runs a multi-step servo sequence, then
  *   reverses it when the switch is released.
  * 
+ * LED Feedback (onboard LED — Pin 13 / LED_BUILTIN):
+ *   - Stays ON continuously after power-up to indicate the board is live.
+ *   - Blinks briefly (LED_BLINK_MS milliseconds) each time a servo step is
+ *     activated during the deploy or retract sequence.
+ * 
  * Hardware:
  *   - Teensy 3.2
  *   - ELRS receiver (e.g. BetaFPV ELRS Nano / Happymodel EP1/EP2)
@@ -33,6 +38,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  CONFIGURATION  (edit these to match your build)
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Onboard LED pin (Teensy 3.2 uses pin 13 — same as LED_BUILTIN)
+// LED stays ON at power-up and blinks on every servo activation step.
+#define LED_PIN        LED_BUILTIN   // pin 13 on Teensy 3.2
+#define LED_BLINK_MS   75            // blink duration in milliseconds per activation
 
 // Serial port connected to the ELRS receiver (UART1 on Teensy 3.2)
 #define CRSF_SERIAL      Serial1
@@ -129,6 +139,14 @@ static bool    lastSwitch    = false;
 //  HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Brief blocking blink — short enough (LED_BLINK_MS ≈ 75 ms) that it does not
+// meaningfully disturb servo hold times (which are 200–500 ms minimum).
+void blinkLed() {
+  digitalWrite(LED_PIN, LOW);         // turn OFF  (was ON from power-up)
+  delay(LED_BLINK_MS);
+  digitalWrite(LED_PIN, HIGH);        // restore ON
+}
+
 void attachServos() {
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     servos[i].attach(SERVO_PINS[i], SERVO_MIN_US, SERVO_MAX_US);
@@ -149,6 +167,7 @@ void resetServos() {
 }
 
 // Run one step of a sequence; returns true when the full sequence is complete.
+// Calls blinkLed() each time a servo is activated.
 bool runSequence(const SequenceStep* seq, uint8_t numSteps) {
   if (seqStep >= numSteps) return true;   // already done
 
@@ -157,18 +176,20 @@ bool runSequence(const SequenceStep* seq, uint8_t numSteps) {
   if (seqStep == 0 || (now - stepTimer) >= seq[seqStep - 1].holdMs) {
     // Execute current step
     moveServo(seq[seqStep].servoIndex, seq[seqStep].targetUs);
-    stepTimer = now;
+    blinkLed();                           // LED blink on servo activation
+    stepTimer = millis();                 // re-sample after blink delay
     seqStep++;
 
     // If this step has zero hold time, immediately chain to next
     if (seq[seqStep - 1].holdMs == 0 && seqStep < numSteps) {
       moveServo(seq[seqStep].servoIndex, seq[seqStep].targetUs);
-      stepTimer = now;
+      blinkLed();                         // LED blink for chained step too
+      stepTimer = millis();               // re-sample after blink delay
       seqStep++;
     }
   }
 
-  return (seqStep >= numSteps && (now - stepTimer) >= seq[numSteps - 1].holdMs);
+  return (seqStep >= numSteps && (millis() - stepTimer) >= seq[numSteps - 1].holdMs);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,13 +197,17 @@ bool runSequence(const SequenceStep* seq, uint8_t numSteps) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void setup() {
+  // Onboard LED — turn ON immediately at power-up
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);    // LED ON → board is live
+
   Serial.begin(115200);           // USB debug serial
   CRSF_SERIAL.begin(CRSF_BAUD);  // ELRS receiver
 
   attachServos();
   resetServos();
 
-  Serial.println(F("TeensyServoControl v2.0 — ready"));
+  Serial.println(F("TeensyServoControl v2.1 — ready"));
   Serial.print(F("Servos on pins: "));
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     Serial.print(SERVO_PINS[i]);
@@ -191,6 +216,11 @@ void setup() {
   Serial.println();
   Serial.print(F("Trigger channel: CH"));
   Serial.println(TRIGGER_CHANNEL);
+  Serial.print(F("LED pin: "));
+  Serial.print(LED_PIN);
+  Serial.print(F("  Blink duration: "));
+  Serial.print(LED_BLINK_MS);
+  Serial.println(F(" ms"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
