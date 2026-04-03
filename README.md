@@ -1,8 +1,10 @@
 # Teensy Servo Control
 
-> **Teensy 3.2 · ExpressLRS (CRSF) input · 9-Servo sequencing · Switch-triggered**
+> **Teensy 3.2 · ExpressLRS (CRSF) input · 9-Servo sequencing · Switch-triggered · CH6 Safety Interlock**
 
 A compact, reliable firmware for the [Teensy 3.2](https://www.pjrc.com/store/teensy32.html) that reads RC channel data from an **ExpressLRS (ELRS)** receiver over the CRSF serial protocol and drives **9 servos** through a multi-step, timed sequence — triggered by a designated switch channel.
+
+A **hardware safety interlock on Channel 6** must be armed before any servo movement can be triggered.
 
 ---
 
@@ -15,14 +17,14 @@ A compact, reliable firmware for the [Teensy 3.2](https://www.pjrc.com/store/tee
    - [Libraries Used](#41-libraries-used)
    - [CRSF Parsing](#42-crsf-parsing)
    - [Servo Control Logic](#43-servo-control-logic)
-   - [Servo Deadband](#44-servo-deadband)
-   - [Sequence Steps](#45-sequence-steps)
-   - [LED Feedback](#46-led-feedback)
-5. [Setup & Upload Instructions](#5-setup--upload-instructions)
-6. [Configuration Options](#6-configuration-options)
-7. [Serial Debug Output](#7-serial-debug-output)
-8. [Troubleshooting](#8-troubleshooting)
-9. [License](#9-license)
+   - [Sequence Steps](#44-sequence-steps)
+   - [LED Feedback](#45-led-feedback)
+5. [Safety Channel (CH6 Interlock)](#5-safety-channel-ch6-interlock)
+6. [Setup & Upload Instructions](#6-setup--upload-instructions)
+7. [Configuration Options](#7-configuration-options)
+8. [Serial Debug Output](#8-serial-debug-output)
+9. [Troubleshooting](#9-troubleshooting)
+10. [License](#10-license)
 
 ---
 
@@ -33,8 +35,9 @@ This project was built for Project 399 to remotely actuate a mechanical servo-dr
 **What it does:**
 
 - Receives CRSF frames from an ELRS receiver at 420 000 baud over UART1.
-- Monitors a configurable switch channel (default: **CH5 / AUX1**).
-- When the switch crosses a threshold (ON): executes a **deploy sequence** — moving each of the 9 servos to their target positions in a defined order with configurable hold times between steps.
+- Monitors a **safety channel (CH6 / AUX2)**. Servo movement is only permitted when CH6 is in the ARMED position (above `SAFETY_THRESHOLD`). When CH6 is SAFE, the trigger channel is completely ignored.
+- Monitors a **trigger channel (CH5 / AUX1)** — active only when the safety is ARMED.
+- When the trigger switch crosses a threshold (ON): executes a **deploy sequence** — moving each of the 9 servos to their target positions in a defined order with configurable hold times between steps.
 - When the switch returns low (OFF): executes a **retract sequence** in reverse.
 - State machine prevents mid-sequence interruption and ensures clean transitions.
 - **Onboard LED (Pin 13)** provides three distinct visual states — see [LED Feedback](#45-led-feedback).
@@ -148,6 +151,7 @@ while (Serial1.available()) crsf.feed(Serial1.read());
 // Check for decoded frame:
 if (crsf.hasNewFrame()) {
     uint16_t ch5 = crsf.getChannel(5);  // 1-indexed, range 172–1811
+    uint16_t ch6 = crsf.getChannel(6);  // safety channel
 }
 ```
 
@@ -157,13 +161,11 @@ Channel values are in the CRSF native range **172–1811** (midpoint ≈ 992). U
 
 Servos are driven by the standard Teensyduino `Servo` library using `writeMicroseconds()` for precise, sub-millisecond resolution.
 
-Each servo's last-written position is tracked in `servoPositionUs[]`. Before any `writeMicroseconds()` call, the firmware computes the distance between the current and target positions and applies the [servo deadband](#44-servo-deadband) check.
-
 The firmware uses a **non-blocking state machine** with four states:
 
 | State | Description |
 |-------|-------------|
-| `STATE_IDLE` | Waiting for switch ON (rising edge) |
+| `STATE_IDLE` | Waiting for switch ON (rising edge) — only reachable when system is ARMED |
 | `STATE_DEPLOYING` | Executing deploy sequence step-by-step |
 | `STATE_DEPLOYED` | Sequence complete — waiting for switch OFF |
 | `STATE_RETRACTING` | Executing retract sequence step-by-step |
@@ -172,51 +174,9 @@ The firmware uses a **non-blocking state machine** with four states:
 
 **Non-blocking timing** — `millis()` is used instead of `delay()`, so the CRSF parser continues to receive bytes even during sequence execution.
 
-### 4.4 Servo Deadband
+**Safety interlock** — before any edge is detected in `STATE_IDLE`, the firmware checks `systemArmed`. If the safety channel (CH6) is in the SAFE position, `switchOn` is forced to `false` and `lastSwitch` is cleared, so no rising edge can be generated regardless of CH5's physical position.
 
-The **servo deadband** prevents continuous micro-adjustments that cause servo jitter, heat, and unnecessary current draw.
-
-#### How It Works
-
-Every servo's most recently commanded position is stored in the `servoPositionUs[]` array (one entry per servo, initialised to `SERVO_MIN_US` at startup). Before sending a new `writeMicroseconds()` command the firmware computes the absolute distance between the current stored position and the new target:
-
-```
-delta = |targetUs - currentUs|
-```
-
-If `delta ≤ SERVO_DEADBAND_US` the write is **suppressed** — no PWM update is sent to the servo hardware and `servoPositionUs[]` is left unchanged. If `delta > SERVO_DEADBAND_US` the write proceeds normally and `servoPositionUs[]` is updated to the new target.
-
-```cpp
-void moveServo(uint8_t idx, uint16_t us) {
-  if (idx >= NUM_SERVOS) return;
-
-  uint16_t current = servoPositionUs[idx];
-  uint16_t delta   = (us > current) ? (us - current) : (current - us);
-
-  if (delta <= SERVO_DEADBAND_US) {
-    return;  // within deadband — skip write to suppress jitter
-  }
-
-  servos[idx].writeMicroseconds(us);
-  servoPositionUs[idx] = us;
-}
-```
-
-#### Configurable Parameter
-
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `SERVO_DEADBAND_US` | `100` | Minimum position change (µs) required to issue a new servo write |
-
-The default of **100 µs** (10% of the full 1000–2000 µs range) is a conservative value that eliminates jitter from repeated identical or near-identical commands without sacrificing meaningful travel resolution. Reduce it if finer positioning accuracy is required; increase it if servos still buzz between sequence steps.
-
-#### Why This Matters
-
-In a multi-step sequence the same servo index can appear in several consecutive steps (e.g. servo 0 is moved to `SERVO_MAX_US` in step 1 and then to `SERVO_MID_US` in the final latching step). Without deadband logic, if the state machine were to revisit a step due to a timing edge case the servo would receive redundant writes and hunt around its target, drawing current and causing mechanical wear. The deadband makes every step **idempotent** — running it twice has the same effect as running it once.
-
----
-
-### 4.6 LED Feedback
+### 4.5 LED Feedback
 
 The onboard LED (pin 13 / `LED_BUILTIN`) provides three distinct visual states.  
 All LED transitions are **fully non-blocking** — implemented as a state machine driven by `millis()` with no `delay()` calls. This ensures servo timing and CRSF communication are never interrupted by LED updates.
@@ -288,7 +248,7 @@ if (signalPresent && (millis() - lastFrameMs) > CRSF_SIGNAL_TIMEOUT_MS) {
 
 ---
 
-### 4.5 Sequence Steps
+### 4.4 Sequence Steps
 
 Each step in a sequence specifies:
 
@@ -319,7 +279,69 @@ Step 10: Servo 0 → 1500 µs (latch/mid)   | hold 200 ms
 
 ---
 
-## 5. Setup & Upload Instructions
+## 5. Safety Channel (CH6 Interlock)
+
+### Overview
+
+Channel 6 (AUX2) acts as a **hardware safety interlock**. The system has two states:
+
+| CH6 Value | State | Effect |
+|-----------|-------|--------|
+| ≤ `SAFETY_THRESHOLD` (default 1500) | **SAFE** | CH5 is completely ignored. No servo movement can be triggered. |
+| > `SAFETY_THRESHOLD` (default 1500) | **ARMED** | CH5 operates normally — trigger switch controls the deploy/retract sequence. |
+
+### Wiring the Safety Switch
+
+Assign a dedicated switch to **AUX2 (CH6)** on your RC transmitter. A **2-position switch** (e.g. SA or SF on EdgeTX/OpenTX) is recommended for clear SAFE/ARMED distinction.
+
+Typical transmitter output:
+- **Down / OFF position** → ~1000 µs → **SAFE** (servos locked)
+- **Up / ON position** → ~2000 µs → **ARMED** (servos active)
+
+### Arming Sequence
+
+For safe operation, always follow this arming order:
+
+1. **Power on** the Teensy and receiver.
+2. **Verify** CH6 is in the SAFE position (down). The system boots SAFE regardless.
+3. **Verify** CH5 is in the OFF/down position.
+4. **Arm** — flip CH6 to the ARMED position. Serial monitor prints `Safety: ARMED`.
+5. **Operate** — CH5 now controls the servo sequence normally.
+
+### Disarming
+
+- Flip CH6 back to SAFE at any time. The system immediately blocks new sequences.
+- If a sequence is currently running when you disarm, it **completes naturally** (the mechanism is allowed to finish its movement for safety). The system will not accept a new trigger until re-armed.
+
+### Configuring the Threshold
+
+Edit `SAFETY_THRESHOLD` in `TeensyServoControl.ino`:
+
+```cpp
+// In the CONFIGURATION block at the top of the sketch:
+#define SAFETY_CHANNEL   6      // CRSF channel for safety switch (1-indexed)
+#define SAFETY_THRESHOLD 1500   // channel value that must be exceeded to ARM
+```
+
+| Switch Type | Recommended `SAFETY_THRESHOLD` |
+|-------------|-------------------------------|
+| 2-position switch | `1200` (arms at top position ~2000 µs) |
+| 3-position switch (arm only at full-up) | `1600` (ignores mid position ~1500 µs) |
+
+CRSF channel range is **172–1811** (midpoint ≈ 992). The default threshold of **1500** safely arms only when the switch is close to its full-up position (~2000 µs) and disarms when in any lower position.
+
+### Serial Debug Output for Safety
+
+When the safety state changes, a log line is printed:
+
+```
+CH6: 1811  Safety: ARMED
+CH6: 172   Safety: SAFE
+```
+
+---
+
+## 6. Setup & Upload Instructions
 
 ### Prerequisites
 
@@ -355,24 +377,37 @@ Step 10: Servo 0 → 1500 µs (latch/mid)   | hold 200 ms
 Open `Tools → Serial Monitor` at **115200 baud**. You should see:
 
 ```
-TeensyServoControl v3.0 — ready
+TeensyServoControl v4.0 — ready
 Servos on pins: 3, 4, 5, 6, 9, 10, 20, 21, 22
 Trigger channel: CH5
+Safety channel:  CH6  threshold: 1500
 LED pin: 13
 LED modes: solid=powered, blink=signal, double-blink=servo active
-CH5: 172  Switch: OFF
-CH5: 172  Switch: OFF
-…
+Safety: SAFE (waiting for CH6 ARM)
+```
+
+Once the receiver is bound and outputting:
+
+```
+CH6: 172   Safety: SAFE          ← CH6 in down/safe position
+CH6: 1811  Safety: ARMED         ← CH6 flipped to arm
+CH5: 172   Switch: OFF
+CH5: 1811  Switch: ON
+→ DEPLOYING
+→ DEPLOYED
+CH5: 172   Switch: OFF
+→ RETRACTING
+→ IDLE
 ```
 
 **Expected LED behavior:**
 - **On first power-up (no receiver connected):** LED ON solid.
 - **After connecting ELRS receiver (bound and outputting):** LED starts continuous blinking (200 ms / 200 ms).
-- **When you flip the trigger switch:** LED switches to double-blink pattern for the duration of the servo sequence, then reverts to continuous blink.
+- **When you flip the trigger switch (CH5, with CH6 armed):** LED switches to double-blink pattern for the duration of the servo sequence, then reverts to continuous blink.
 
 ---
 
-## 6. Configuration Options
+## 7. Configuration Options
 
 All user-configurable options are at the top of `TeensyServoControl.ino`:
 
@@ -380,13 +415,14 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 |----------|---------|-------------|
 | `CRSF_SERIAL` | `Serial1` | UART connected to ELRS receiver |
 | `CRSF_BAUD` | `420000` | CRSF baud rate (do not change) |
-| `TRIGGER_CHANNEL` | `5` | RC channel number that triggers the sequence (1–16) |
-| `SWITCH_THRESHOLD` | `1200` | Channel value above this = switch ON (range 172–1811) |
+| `TRIGGER_CHANNEL` | `5` | RC channel that triggers the sequence (1–16). Default: CH5 / AUX1 |
+| `SWITCH_THRESHOLD` | `1200` | Channel value above this = trigger switch ON (range 172–1811) |
+| `SAFETY_CHANNEL` | `6` | RC channel for the safety interlock (1–16). Default: CH6 / AUX2 |
+| `SAFETY_THRESHOLD` | `1500` | Channel value above this = system ARMED (range 172–1811) |
 | `SERVO_PINS[]` | `{3, 4, 5, 6, 9, 10, 20, 21, 22}` | Teensy pin numbers for each of the 9 servos |
 | `SERVO_MIN_US` | `1000` | Servo minimum pulse width (µs) |
 | `SERVO_MAX_US` | `2000` | Servo maximum pulse width (µs) |
 | `SERVO_MID_US` | `1500` | Servo centre/mid pulse width (µs) |
-| `SERVO_DEADBAND_US` | `100` | Minimum µs change to issue a new servo write (deadband range) |
 | `DEPLOY_SEQUENCE[]` | See code | Steps to run when switch goes ON |
 | `RETRACT_SEQUENCE[]` | See code | Steps to run when switch goes OFF |
 | `LED_PIN` | `LED_BUILTIN` (pin 13) | Onboard LED pin — do not change for Teensy 3.2 |
@@ -395,6 +431,13 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 | `LED_SERVO_PULSE_MS` | `100` | Double-blink each pulse duration (servo active) |
 | `LED_SERVO_GAP_MS` | `300` | Double-blink gap after second pulse (servo active) |
 | `CRSF_SIGNAL_TIMEOUT_MS` | `500` | ms without a CRSF frame before signal is marked lost |
+
+### Default Channel Mapping
+
+| CRSF Channel | Function | Transmitter Switch | Active When |
+|-------------|----------|-------------------|------------|
+| **CH5 (AUX1)** | Trigger switch — starts/stops servo sequence | SA (2-pos) or any AUX switch | > 1200 |
+| **CH6 (AUX2)** | Safety interlock — must be ARMED first | SB / SF (dedicated safety switch) | > 1500 |
 
 ### Changing the trigger channel
 
@@ -407,10 +450,13 @@ Map `TRIGGER_CHANNEL` to any AUX switch on your transmitter. Typical EdgeTX/Open
 | 7 | AUX3 | SC |
 | 8 | AUX4 | SD |
 
+> **Note:** `TRIGGER_CHANNEL` and `SAFETY_CHANNEL` must be different channels. Do not assign the same channel to both functions.
+
 ### Adjusting the threshold
 
 - For a **2-position switch**: set `SWITCH_THRESHOLD = 1200` (detects high position).
 - For a **3-position switch**: set `SWITCH_THRESHOLD = 1600` (only fires at top position).
+- For the safety channel with a **3-position switch**: set `SAFETY_THRESHOLD = 1600` to require full-up to arm.
 
 ### Adding / removing servos
 
@@ -426,47 +472,53 @@ on the Teensy 3.2: `23`, `25`, `32`.
 
 ---
 
-## 7. Serial Debug Output
+## 8. Serial Debug Output
 
 With USB connected and Serial Monitor open at **115200 baud**:
 
 ```
-TeensyServoControl v3.0 — ready
+TeensyServoControl v4.0 — ready
 Servos on pins: 3, 4, 5, 6, 9, 10, 20, 21, 22
 Trigger channel: CH5
+Safety channel:  CH6  threshold: 1500
 LED pin: 13
 LED modes: solid=powered, blink=signal, double-blink=servo active
-CH5: 172  Switch: OFF       ← polling every 200 ms (non-blocking)
+Safety: SAFE (waiting for CH6 ARM)
+CH6: 172   Safety: SAFE          ← receiver bound, CH6 still down
+CH6: 1811  Safety: ARMED         ← user flipped safety switch
+CH5: 172   Switch: OFF           ← polling every 200 ms (non-blocking)
 CH5: 1811  Switch: ON
 → DEPLOYING
 → DEPLOYED
-CH5: 172  Switch: OFF
+CH5: 172   Switch: OFF
 → RETRACTING
 → IDLE
+CH6: 172   Safety: SAFE          ← safety flipped back; no new sequences
 ```
 
-To reduce serial overhead in production, comment out the debug block inside the `hasNewFrame()` branch in `loop()`.
+To reduce serial overhead in production, comment out the debug blocks inside the `hasNewFrame()` branch in `loop()`.
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
 | No channel data / `CH5: 0` | Wrong UART RX pin or baud rate | Check wiring to Pin 0; verify CRSF output mode on receiver |
 | Servos don't move | Wrong servo pins or no external power | Confirm `SERVO_PINS[]`, check BEC voltage at servo connector |
+| Servos don't move even with CH5 ON | CH6 is in SAFE position | Flip CH6 to ARMED position; confirm `Safety: ARMED` in Serial Monitor |
 | Sequence fires immediately on boot | Receiver not bound / outputting zero | Add a startup delay or check receiver binding |
 | Sequence runs twice | Switch debounce | Edge detection is already implemented; check for electrical noise on the switch line |
 | Upload fails | Teensy not in bootloader mode | Press the button on the Teensy or check USB connection |
 | `crsf_parser.h` not found | File not in same folder as `.ino` | Both files must be inside `TeensyServoControl/` folder |
 | Servos jitter or draw excess current | All 9 servos from same BEC | Ensure BEC is rated for the combined stall current (≥9 A recommended) |
-| Servo doesn’t move to a new target | Target is within deadband of current position | Adjust `SERVO_DEADBAND_US` downward, or verify the sequence step target differs by more than 100 µs from the prior position |
 | LED stays solid, won't blink | No CRSF signal received | Check receiver wiring/binding; LED blinks only when frames arrive |
-| LED blinks but double-blink never shows | Switch threshold not crossed | Verify `TRIGGER_CHANNEL` and `SWITCH_THRESHOLD` settings |
+| LED blinks but double-blink never shows | Switch threshold not crossed, or safety SAFE | Verify `TRIGGER_CHANNEL`, `SWITCH_THRESHOLD`, and that `SAFETY_CHANNEL` is ARMED |
+| Safety state never shows ARMED | `SAFETY_THRESHOLD` too high | Lower `SAFETY_THRESHOLD` or verify the transmitter switch output value via Serial Monitor |
 
 ---
 
-## 9. License
+## 10. License
 
 MIT License — free to use, modify, and distribute.  
 © 2026 Jordan Temkin / Project 399
@@ -475,12 +527,16 @@ MIT License — free to use, modify, and distribute.
 
 ## Changelog
 
-### v3.1
-- **Added servo deadband** (`SERVO_DEADBAND_US = 100` µs) — `moveServo()` now suppresses `writeMicroseconds()` calls when the target is within the deadband of the current position.
-- Added `servoPositionUs[]` array to track the last-written position for each servo.
-- `resetServos()` initialises `servoPositionUs[]` to `SERVO_MIN_US` on startup.
-- Updated README with [Servo Deadband](#44-servo-deadband) section, updated Configuration Options table, and new Troubleshooting entry.
-- Bumped version string to `v3.1`.
+### v4.0
+- **Added CH6 safety interlock** — a dedicated hardware safety channel (default: CH6 / AUX2)
+  - New constants `SAFETY_CHANNEL` (default `6`) and `SAFETY_THRESHOLD` (default `1500`)
+  - New global `systemArmed` flag, updated every CRSF frame from CH6 value
+  - When `systemArmed == false`: `switchOn` and `lastSwitch` are forced to `false`, preventing any rising-edge detection in `STATE_IDLE`
+  - In-flight sequences (already running when safety is disarmed) complete naturally
+  - Serial monitor prints `Safety: ARMED` / `Safety: SAFE` on every state change
+- Updated startup message to print safety channel and threshold
+- Bumped version string to `v4.0`
+- Updated README with full [Safety Channel (CH6 Interlock)](#5-safety-channel-ch6-interlock) section, channel mapping table, arming sequence, and troubleshooting entries
 
 ### v3.0
 - **Revised LED feedback** — three distinct non-blocking LED states:
