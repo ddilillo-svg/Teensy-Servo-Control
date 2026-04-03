@@ -1,7 +1,7 @@
 /**
  * TeensyServoControl.ino
  * 
- * Teensy 3.2 — CRSF (ExpressLRS) Input → Servo Sequencing Controller
+ * Teensy 3.2 — CRSF (ExpressLRS) Input → 9-Servo Sequencing Controller
  * 
  * Author:  Jordan Temkin <399project@gmail.com>
  * Project: Project 399
@@ -15,7 +15,7 @@
  * Hardware:
  *   - Teensy 3.2
  *   - ELRS receiver (e.g. BetaFPV ELRS Nano / Happymodel EP1/EP2)
- *   - Up to NUM_SERVOS servos wired to SERVO_PINS[]
+ *   - 9 servos wired to SERVO_PINS[]
  * 
  * Wiring:
  *   ELRS RX TX-pin  →  Teensy Pin 0  (Serial1 RX)
@@ -47,8 +47,10 @@
 #define SWITCH_THRESHOLD 1200
 
 // Servo output pins on Teensy 3.2
-// Add or remove pins as needed; NUM_SERVOS is derived automatically
-static const uint8_t SERVO_PINS[] = { 3, 4, 5, 6 };
+// Hardware PWM-capable pins: 3, 4, 5, 6, 9, 10, 20, 21, 22, 23, 25, 32
+// Pins 0 and 1 are reserved for CRSF serial (RX1/TX1).
+// Add or remove pins as needed; NUM_SERVOS is derived automatically.
+static const uint8_t SERVO_PINS[] = { 3, 4, 5, 6, 9, 10, 20, 21, 22 };
 #define NUM_SERVOS  (sizeof(SERVO_PINS) / sizeof(SERVO_PINS[0]))
 
 // Servo travel limits (microseconds — safe universal range)
@@ -73,8 +75,17 @@ static const SequenceStep DEPLOY_SEQUENCE[] = {
   { 1, SERVO_MAX_US, 300 },
   // Step 3: move servos 2 & 3 simultaneously (fire both at once via back-to-back steps, 0 ms gap)
   { 2, SERVO_MAX_US,   0 },
-  { 3, SERVO_MAX_US, 500 },
-  // Step 4: return servo 0 to mid as a latch
+  { 3, SERVO_MAX_US, 300 },
+  // Step 4: move servo 4 to full extend
+  { 4, SERVO_MAX_US, 300 },
+  // Step 5: move servo 5 to full extend
+  { 5, SERVO_MAX_US, 300 },
+  // Step 6: move servos 6 & 7 simultaneously
+  { 6, SERVO_MAX_US,   0 },
+  { 7, SERVO_MAX_US, 300 },
+  // Step 7: move servo 8 to full extend
+  { 8, SERVO_MAX_US, 500 },
+  // Step 8: return servo 0 to mid as a latch
   { 0, SERVO_MID_US, 200 },
 };
 #define DEPLOY_STEPS  (sizeof(DEPLOY_SEQUENCE) / sizeof(DEPLOY_SEQUENCE[0]))
@@ -82,6 +93,11 @@ static const SequenceStep DEPLOY_SEQUENCE[] = {
 // ── RETRACT SEQUENCE (switch OFF) ─────────────────────────────────────────────
 // Mirror / reverse of deploy, runs when the switch returns low.
 static const SequenceStep RETRACT_SEQUENCE[] = {
+  { 8, SERVO_MIN_US, 300 },
+  { 7, SERVO_MIN_US, 300 },
+  { 6, SERVO_MIN_US, 300 },
+  { 5, SERVO_MIN_US, 300 },
+  { 4, SERVO_MIN_US, 300 },
   { 3, SERVO_MIN_US, 300 },
   { 2, SERVO_MIN_US, 300 },
   { 0, SERVO_MIN_US,   0 },
@@ -166,7 +182,7 @@ void setup() {
   attachServos();
   resetServos();
 
-  Serial.println(F("TeensyServoControl v1.0 — ready"));
+  Serial.println(F("TeensyServoControl v2.0 — ready"));
   Serial.print(F("Servos on pins: "));
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     Serial.print(SERVO_PINS[i]);
