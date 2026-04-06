@@ -1,6 +1,7 @@
 # Teensy Servo Control
 
 > **Teensy 3.2 · ExpressLRS (CRSF) input · 9-Servo strictly sequential control · Switch-triggered · CH6 safety interlock**
+> **Firmware version: v4.2**
 
 A compact, reliable firmware for the [Teensy 3.2](https://www.pjrc.com/store/teensy32.html) that reads RC channel data from an **ExpressLRS (ELRS)** receiver over the CRSF serial protocol and drives **9 servos** in a **strictly sequential** fashion — one servo per switch flip, never two servos at once.  A dedicated **CH6 safety interlock** must be armed before any servo movement is permitted.
 
@@ -270,7 +271,7 @@ All LED transitions are **fully non-blocking** — implemented as a state machin
 Open `Tools → Serial Monitor` at **115200 baud**. You should see:
 
 ```
-TeensyServoControl v4.1 — ready
+TeensyServoControl v4.2 — ready
 Servos on pins: 3, 4, 5, 6, 9, 10, 20, 21, 22
 Trigger channel: CH5
 Safety channel:  CH6  threshold: 1500
@@ -340,7 +341,7 @@ Additional hardware PWM-capable pins on the Teensy 3.2: `23`, `25`, `32`.
 With USB connected and Serial Monitor open at **115200 baud**:
 
 ```
-TeensyServoControl v4.1 — ready
+TeensyServoControl v4.2 — ready
 ...
 Safety: SAFE (waiting for CH6 ARM)
 CH6: 2000  Safety: ARMED
@@ -367,7 +368,7 @@ CH5: 1811  Switch: ON   FlipCount: 1
 |---------|-------------|-----|
 | No channel data / `CH5: 0` | Wrong UART RX pin or baud rate | Check wiring to Pin 0; verify CRSF output mode on receiver |
 | Servos don't move | Safety not armed, wrong servo pins, or no external power | Confirm CH6 is ARMED; check `SERVO_PINS[]` and BEC voltage |
-| Multiple servos move on one flip | Should not happen with v4.1 — if seen, re-flash | All simultaneous-fire chaining was removed in v4.1 |
+| Multiple servos move on one flip | Should not happen with v4.1+ — if seen, re-flash | All simultaneous-fire chaining was removed in v4.1 |
 | All-close won't start | Switch ignored while retract running | Wait for the retract sequence to finish |
 | Flips work but sequence restarts unexpectedly | `flipCount` reset mid-cycle | Only happens after a completed retract or power cycle — expected |
 | Upload fails | Teensy not in bootloader mode | Press the button on the Teensy or check USB connection |
@@ -386,6 +387,14 @@ MIT License — free to use, modify, and distribute.
 ---
 
 ## Changelog
+
+### v4.2
+- **Live RC channel readout** on Serial Monitor (115200 baud)
+- Prints CH5 and CH6 raw CRSF values every 200 ms — always active regardless of armed/safe state
+- Output format: `CH5: 1811 | CH6: 172  [ARMED | Switch: ON  | Flip: 3]`
+- Configurable via `RC_READOUT_INTERVAL_MS` (default 200 ms)
+- Added `latestCh5` / `latestCh6` globals updated on every CRSF frame so the readout always reflects the most recent values
+- Version bumped to v4.2
 
 ### v4.1
 - **Strictly sequential servo activation** — one servo per switch flip, no exceptions
@@ -406,6 +415,11 @@ MIT License — free to use, modify, and distribute.
   - `systemArmed` flag: CH5 trigger is ignored when CH6 is in SAFE position
   - Edge-detection latch (`lastSwitch`) cleared on disarm to prevent false triggers
   - Serial debug logs each ARM/SAFE transition
+
+### v3.1
+- **Servo deadband** (`SERVO_DEADBAND_US`) to suppress jitter at neutral
+- Reduced deadband from 100 µs to 10 µs after real-world testing
+- Servo output only updates when commanded position differs from last position by more than the deadband threshold
 
 ### v3.0
 - Revised LED feedback — three distinct non-blocking LED states

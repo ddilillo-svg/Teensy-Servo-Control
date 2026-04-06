@@ -2,6 +2,7 @@
  * TeensyServoControl.ino
  *
  * Teensy 3.2 — CRSF (ExpressLRS) Input → 9-Servo Sequential Controller
+ * Version: v4.2
  *
  * Author:  Jordan Temkin <399project@gmail.com>
  * Project: Project 399
@@ -327,7 +328,7 @@ void setup() {
   attachServos();
   resetServos();
 
-  Serial.println(F("TeensyServoControl v4.1 — ready"));
+  Serial.println(F("TeensyServoControl v4.2 — ready"));
   Serial.print(F("Servos on pins: "));
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     Serial.print(SERVO_PINS[i]);
