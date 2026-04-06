@@ -31,6 +31,16 @@
  *   After the "all close" retract sequence finishes the counter resets to 0 and
  *   the cycle can repeat from Flip 1.
  *
+ * Serial Monitor (115200 baud):
+ *   A live RC channel readout is printed every 200 ms showing the raw CRSF values
+ *   for both control channels.  This is always active — regardless of safety state.
+ *
+ *   Format:  CH5: 1811 | CH6: 172  [ARMED | Switch: ON  | Flip: 3]
+ *
+ *   CH5 = trigger channel (servo trigger switch)
+ *   CH6 = safety switch (must be ARMED for servo movement)
+ *   CRSF value range: 172 (low) – 1811 (high), midpoint ≈ 992
+ *
  * LED Feedback (onboard LED — Pin 13 / LED_BUILTIN):
  *   - Stays ON solid after power-up to indicate the board is live.
  *   - Blinks continuously (200 ms ON / 200 ms OFF) while CRSF signal is actively
@@ -77,6 +87,9 @@
 
 // Timeout to consider CRSF signal "lost" if no new frame arrives within this window
 #define CRSF_SIGNAL_TIMEOUT_MS  500  // ms without a frame → signal considered absent
+
+// Live RC channel readout interval (ms) — how often CH5/CH6 values print to Serial
+#define RC_READOUT_INTERVAL_MS  200  // print every 200 ms
 
 // Serial port connected to the ELRS receiver (UART1 on Teensy 3.2)
 #define CRSF_SERIAL      Serial1
@@ -167,6 +180,14 @@ static uint32_t lastFrameMs   = 0;
 
 // Whether the retract sequence is active (used by LED logic)
 static bool     servoActive   = false;
+
+// ── RC channel readout ────────────────────────────────────────────────────────
+// Most-recently decoded values for CH5 and CH6 — updated every CRSF frame.
+// Stored separately so the periodic readout can always print the latest values
+// even in loop iterations that don't have a new frame.
+static uint16_t latestCh5     = 0;
+static uint16_t latestCh6     = 0;
+static uint32_t rcReadoutTimer = 0;  // millis() of last readout print
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  LED HELPERS  (fully non-blocking)
@@ -353,30 +374,16 @@ void loop() {
     systemArmed        = (safetyVal > SAFETY_THRESHOLD);
 
     if (systemArmed != prevArmed) {
-      Serial.print(F("CH"));
-      Serial.print(SAFETY_CHANNEL);
-      Serial.print(F(": "));
-      Serial.print(safetyVal);
-      Serial.println(systemArmed ? F("  Safety: ARMED") : F("  Safety: SAFE"));
+      Serial.println(systemArmed ? F("Safety: ARMED") : F("Safety: SAFE"));
     }
+
+    // ── Store latest channel values for live readout ───────────────────────
+    latestCh5 = crsf.getChannel(TRIGGER_CHANNEL);
+    latestCh6 = safetyVal;
 
     // ── CH5 TRIGGER — only when armed ─────────────────────────────────────
     if (systemArmed) {
-      uint16_t chVal = crsf.getChannel(TRIGGER_CHANNEL);
-      switchOn = (chVal > SWITCH_THRESHOLD);
-
-      static uint32_t dbgTimer = 0;
-      if (now - dbgTimer > 200) {
-        dbgTimer = now;
-        Serial.print(F("CH"));
-        Serial.print(TRIGGER_CHANNEL);
-        Serial.print(F(": "));
-        Serial.print(chVal);
-        Serial.print(F("  Switch: "));
-        Serial.print(switchOn ? F("ON") : F("OFF"));
-        Serial.print(F("  FlipCount: "));
-        Serial.println(flipCount);
-      }
+      switchOn = (latestCh5 > SWITCH_THRESHOLD);
     }
   }
 
@@ -434,6 +441,25 @@ void loop() {
   }
 
   lastSwitch = switchOn;
+
+  // ── Live RC channel readout ──────────────────────────────────────────────
+  // Prints CH5 and CH6 raw CRSF values every RC_READOUT_INTERVAL_MS.
+  // Always active — regardless of armed state — so you can verify signal
+  // reception and switch positions at any time.
+  if ((now - rcReadoutTimer) >= RC_READOUT_INTERVAL_MS) {
+    rcReadoutTimer = now;
+    Serial.print(F("CH5: "));
+    Serial.print(latestCh5);
+    Serial.print(F(" | CH6: "));
+    Serial.print(latestCh6);
+    Serial.print(F("  ["));
+    Serial.print(systemArmed ? F("ARMED") : F("SAFE "));
+    Serial.print(F(" | Switch: "));
+    Serial.print((latestCh5 > SWITCH_THRESHOLD) ? F("ON ") : F("OFF"));
+    Serial.print(F(" | Flip: "));
+    Serial.print(flipCount);
+    Serial.println(F("]"));
+  }
 
   // ── Update LED ────────────────────────────────────────────────────────────
   updateLed();
