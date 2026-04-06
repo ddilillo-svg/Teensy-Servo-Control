@@ -2,7 +2,7 @@
  * TeensyServoControl.ino
  *
  * Teensy 3.2 — CRSF (ExpressLRS) Input → 9-Servo Sequential Controller
- * Version: v4.2
+ * Version: v4.3
  *
  * Author:  Jordan Temkin <399project@gmail.com>
  * Project: Project 399
@@ -108,17 +108,22 @@
 // ── SAFETY CHANNEL (CH6 / AUX2) ──────────────────────────────────────────────
 // CRSF channel that acts as a hardware safety interlock (1-indexed).
 // The firmware will not allow any servo movement unless this channel is in the
-// ARMED position (above SAFETY_THRESHOLD).
+// ARMED position (below SAFETY_THRESHOLD).
 //
-//   CH6 ≤ SAFETY_THRESHOLD  →  SAFE  (no servo movement permitted)
-//   CH6 > SAFETY_THRESHOLD  →  ARMED (CH5 trigger is active)
+// This build uses an inverted safety switch — the armed position produces the
+// LOW CRSF value and the safe/disarmed position produces the higher value:
 //
-// Wire a dedicated 2-position or 3-position switch to AUX2 on your transmitter
-// and configure it to output ~1000 µs (safe) and ~2000 µs (armed).
-// For a 3-position switch set SAFETY_THRESHOLD = 1600 so only the full-up
-// position arms the system.
+//   CH6 = 172  →  ARMED  (switch in arm position   — LOW end of range)
+//   CH6 = 992  →  SAFE   (switch in disarm position — midpoint)
+//
+// Comparison: safetyVal < SAFETY_THRESHOLD
+//   172 < 500  →  true   →  ARMED
+//   992 < 500  →  false  →  SAFE
+//
+// SAFETY_THRESHOLD = 500 is the midpoint between 172 and 992, giving a clean
+// separation between the two switch positions.
 #define SAFETY_CHANNEL   6
-#define SAFETY_THRESHOLD 1500        // channel value that must be exceeded to ARM
+#define SAFETY_THRESHOLD 500         // CH6 < threshold = ARMED (172); CH6 >= threshold = SAFE (992)
 
 // Servo output pins on Teensy 3.2
 // Hardware PWM-capable pins: 3, 4, 5, 6, 9, 10, 20, 21, 22, 23, 25, 32
@@ -328,7 +333,7 @@ void setup() {
   attachServos();
   resetServos();
 
-  Serial.println(F("TeensyServoControl v4.2 — ready"));
+  Serial.println(F("TeensyServoControl v4.3 — ready"));
   Serial.print(F("Servos on pins: "));
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     Serial.print(SERVO_PINS[i]);
@@ -372,7 +377,7 @@ void loop() {
     // ── CH6 SAFETY INTERLOCK ────────────────────────────────────────────────
     uint16_t safetyVal = crsf.getChannel(SAFETY_CHANNEL);
     bool prevArmed     = systemArmed;
-    systemArmed        = (safetyVal > SAFETY_THRESHOLD);
+    systemArmed        = (safetyVal < SAFETY_THRESHOLD);  // 172 (armed) < 500; 992 (safe) >= 500
 
     if (systemArmed != prevArmed) {
       Serial.println(systemArmed ? F("Safety: ARMED") : F("Safety: SAFE"));

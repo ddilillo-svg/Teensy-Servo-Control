@@ -1,7 +1,7 @@
 # Teensy Servo Control
 
 > **Teensy 3.2 · ExpressLRS (CRSF) input · 9-Servo strictly sequential control · Switch-triggered · CH6 safety interlock**
-> **Firmware version: v4.2**
+> **Firmware version: v4.3**
 
 A compact, reliable firmware for the [Teensy 3.2](https://www.pjrc.com/store/teensy32.html) that reads RC channel data from an **ExpressLRS (ELRS)** receiver over the CRSF serial protocol and drives **9 servos** in a **strictly sequential** fashion — one servo per switch flip, never two servos at once.  A dedicated **CH6 safety interlock** must be armed before any servo movement is permitted.
 
@@ -198,12 +198,21 @@ Servos retract **one at a time**, highest index first (servo 9 → servo 1), wit
 
 ### 4.5 CH6 Safety Interlock
 
-A dedicated safety channel (CH6 / AUX2) must be in the ARMED position before any servo can move:
+A dedicated safety channel (CH6 / AUX2) must be in the ARMED position before any servo can move.
+
+This build uses an **inverted safety switch** — the arm position produces the **low** CRSF value and the safe/disarmed position produces a higher value:
+
+| CH6 Value | Switch Position | System State |
+|-----------|-----------------|-------------|
+| 172 | ARM position (low) | **ARMED** — CH5 trigger active |
+| 992 | DISARM/SAFE position (mid) | **SAFE** — no servo movement permitted |
 
 ```
-CH6 ≤ SAFETY_THRESHOLD  →  SAFE   (no servo movement permitted)
-CH6 > SAFETY_THRESHOLD  →  ARMED  (CH5 trigger is active)
+CH6 < SAFETY_THRESHOLD (500)  →  ARMED  (CH5 trigger is active)
+CH6 ≥ SAFETY_THRESHOLD (500)  →  SAFE   (no servo movement permitted)
 ```
+
+`SAFETY_THRESHOLD = 500` sits at the midpoint between `172` and `992`, giving clean separation between the two switch positions.
 
 When `systemArmed` is `false`:
 - `switchOn` is forced to `false` every loop, so no rising edges can register.
@@ -271,10 +280,10 @@ All LED transitions are **fully non-blocking** — implemented as a state machin
 Open `Tools → Serial Monitor` at **115200 baud**. You should see:
 
 ```
-TeensyServoControl v4.2 — ready
+TeensyServoControl v4.3 — ready
 Servos on pins: 3, 4, 5, 6, 9, 10, 20, 21, 22
 Trigger channel: CH5
-Safety channel:  CH6  threshold: 1500
+Safety channel:  CH6  threshold: 500
 Servos per cycle: 9
 Mode: strictly sequential — one servo per switch flip
 Flip 1-9: extend servo 1-9 individually
@@ -305,7 +314,7 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 | `TRIGGER_CHANNEL` | `5` | RC channel number that advances the sequence (1–16) |
 | `SWITCH_THRESHOLD` | `1810` | Channel value above this = switch ON (range 172–1811) |
 | `SAFETY_CHANNEL` | `6` | RC channel used as safety interlock (1–16) |
-| `SAFETY_THRESHOLD` | `1500` | Channel value that must be exceeded to ARM the system |
+| `SAFETY_THRESHOLD` | `500` | Midpoint threshold between ARMED (`172`) and SAFE (`992`). `CH6 < 500` = ARMED; `CH6 ≥ 500` = SAFE. |
 | `SERVO_PINS[]` | `{3, 4, 5, 6, 9, 10, 20, 21, 22}` | Teensy pin numbers for each of the 9 servos |
 | `SERVO_MIN_US` | `1000` | Servo minimum pulse width / retracted position (µs) |
 | `SERVO_MAX_US` | `2000` | Servo maximum pulse width / extended position (µs) |
@@ -319,8 +328,9 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 
 ### Adjusting switch thresholds
 
-- For a **2-position switch**: `SWITCH_THRESHOLD = 1810`, `SAFETY_THRESHOLD = 1500`.
-- For a **3-position switch used as safety**: set `SAFETY_THRESHOLD = 1600` so only the full-up position arms the system.
+- **Current safety switch (inverted):** `SAFETY_THRESHOLD = 500` — armed position outputs `172` (low), safe position outputs `992`. Comparison is `safetyVal < SAFETY_THRESHOLD`.
+- **Standard (non-inverted) safety switch:** if your transmitter outputs high for armed (`~1811`) and low for safe (`~172`), change the comparison back to `safetyVal > SAFETY_THRESHOLD` and set `SAFETY_THRESHOLD = 1500`.
+- **3-position switch:** set threshold at the midpoint between the two positions you want to distinguish.
 
 ### Adding / removing servos
 
@@ -375,7 +385,7 @@ CH5: 1811  Switch: ON   FlipCount: 1
 | `crsf_parser.h` not found | File not in same folder as `.ino` | Both files must be inside `TeensyServoControl/` folder |
 | Servos jitter or draw excess current | Insufficient BEC capacity | Ensure BEC is rated for combined stall current (≥9 A recommended) |
 | LED stays solid, won't blink | No CRSF signal received | Check receiver wiring/binding; LED blinks only when frames arrive |
-| Safety always shows SAFE | Wrong channel or threshold | Verify `SAFETY_CHANNEL` and `SAFETY_THRESHOLD` match your transmitter mapping |
+| Safety always shows SAFE | Wrong channel or threshold | Verify `SAFETY_CHANNEL` and `SAFETY_THRESHOLD` match your transmitter mapping. This build: CH6=172 → ARMED, CH6=992 → SAFE. |
 
 ---
 
@@ -387,6 +397,13 @@ MIT License — free to use, modify, and distribute.
 ---
 
 ## Changelog
+
+### v4.3
+- **Safety interlock threshold corrected for inverted switch wiring**
+- `SAFETY_THRESHOLD` changed from `1500` to `500`
+- Safety comparison inverted: now `safetyVal < SAFETY_THRESHOLD` to correctly identify `172` as ARMED and `992` as SAFE
+- Updated comments and README to document the actual CH6 switch values and inverted logic
+- Version bumped to v4.3
 
 ### v4.2
 - **Live RC channel readout** on Serial Monitor (115200 baud)
