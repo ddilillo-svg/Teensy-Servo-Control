@@ -303,7 +303,7 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 | `CRSF_SERIAL` | `Serial1` | UART connected to ELRS receiver |
 | `CRSF_BAUD` | `420000` | CRSF baud rate (do not change) |
 | `TRIGGER_CHANNEL` | `5` | RC channel number that advances the sequence (1–16) |
-| `SWITCH_THRESHOLD` | `1200` | Channel value above this = switch ON (range 172–1811) |
+| `SWITCH_THRESHOLD` | `1810` | Channel value above this = switch ON (range 172–1811) |
 | `SAFETY_CHANNEL` | `6` | RC channel used as safety interlock (1–16) |
 | `SAFETY_THRESHOLD` | `1500` | Channel value that must be exceeded to ARM the system |
 | `SERVO_PINS[]` | `{3, 4, 5, 6, 9, 10, 20, 21, 22}` | Teensy pin numbers for each of the 9 servos |
@@ -319,7 +319,7 @@ All user-configurable options are at the top of `TeensyServoControl.ino`:
 
 ### Adjusting switch thresholds
 
-- For a **2-position switch**: `SWITCH_THRESHOLD = 1200`, `SAFETY_THRESHOLD = 1500`.
+- For a **2-position switch**: `SWITCH_THRESHOLD = 1810`, `SAFETY_THRESHOLD = 1500`.
 - For a **3-position switch used as safety**: set `SAFETY_THRESHOLD = 1600` so only the full-up position arms the system.
 
 ### Adding / removing servos

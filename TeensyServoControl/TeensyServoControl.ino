@@ -103,7 +103,7 @@
 
 // Switch threshold: channel value above this = "switch ON"
 // CRSF channel range is 172–1811, midpoint ≈ 992
-#define SWITCH_THRESHOLD 1200
+#define SWITCH_THRESHOLD 1810
 
 // ── SAFETY CHANNEL (CH6 / AUX2) ──────────────────────────────────────────────
 // CRSF channel that acts as a hardware safety interlock (1-indexed).
