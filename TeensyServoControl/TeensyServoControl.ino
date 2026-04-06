@@ -2,7 +2,7 @@
  * TeensyServoControl.ino
  *
  * Teensy 3.2 — CRSF (ExpressLRS) Input → 9-Servo Sequential Controller
- * Version: v4.3
+ * Version: v4.4
  *
  * Author:  Jordan Temkin <399project@gmail.com>
  * Project: Project 399
@@ -101,8 +101,9 @@
 // Typical RC mapping: CH5 = AUX1 (first aux switch).
 #define TRIGGER_CHANNEL  5
 
-// Switch threshold: channel value above this = "switch ON"
+// Switch threshold: channel value at or above this = "switch ON"
 // CRSF channel range is 172–1811, midpoint ≈ 992
+// Use >= so SWITCH_THRESHOLD itself and the CRSF max (1811) both register ON.
 #define SWITCH_THRESHOLD 1810
 
 // ── SAFETY CHANNEL (CH6 / AUX2) ──────────────────────────────────────────────
@@ -333,7 +334,7 @@ void setup() {
   attachServos();
   resetServos();
 
-  Serial.println(F("TeensyServoControl v4.3 — ready"));
+  Serial.println(F("TeensyServoControl v4.4 — ready"));
   Serial.print(F("Servos on pins: "));
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     Serial.print(SERVO_PINS[i]);
@@ -369,7 +370,20 @@ void loop() {
   }
 
   // ── Read new CRSF frame ───────────────────────────────────────────────────
-  bool switchOn = false;
+  //
+  // BUG FIX (v4.4): Previously switchOn was a local bool initialised to false
+  // at the top of every loop() iteration and only set true inside the
+  // hasNewFrame() block.  Because loop() runs far faster than the ~150 Hz
+  // CRSF frame rate, the overwhelming majority of iterations had switchOn=false
+  // even while the stick was held at the high position.  This meant lastSwitch
+  // was reset to false on nearly every iteration, so the rising-edge condition
+  // (switchOn && !lastSwitch) never fired reliably — the system always reported
+  // "Switch: OFF" and FlipCount never advanced.
+  //
+  // Fix: update latestCh5 / systemArmed only when a frame arrives, then derive
+  // switchOn from the PERSISTENT latestCh5 value below, so it stays true for
+  // every loop() iteration while the stick is held at or above SWITCH_THRESHOLD.
+  // Also change > to >= so that the threshold value itself registers as ON.
   if (crsf.hasNewFrame()) {
     lastFrameMs   = now;
     signalPresent = true;
@@ -387,11 +401,19 @@ void loop() {
     latestCh5 = crsf.getChannel(TRIGGER_CHANNEL);
     latestCh6 = safetyVal;
 
-    // ── CH5 TRIGGER — only when armed ─────────────────────────────────────
-    if (systemArmed) {
-      switchOn = (latestCh5 > SWITCH_THRESHOLD);
-    }
+    // Verbose per-frame debug: trace raw CH5 value and threshold comparison
+    Serial.print(F("[CRSF] CH5="));
+    Serial.print(latestCh5);
+    Serial.print(F(" thr="));
+    Serial.print(SWITCH_THRESHOLD);
+    Serial.print(F(" armed="));
+    Serial.println(systemArmed ? F("Y") : F("N"));
   }
+
+  // Derive switchOn from persistent latestCh5 — remains stable across all
+  // loop() iterations, not just the one where a new frame arrived.
+  // Use >= so SWITCH_THRESHOLD itself (1810) and CRSF max (1811) both trigger.
+  bool switchOn = systemArmed && (latestCh5 >= SWITCH_THRESHOLD);
 
   // ── Signal timeout ────────────────────────────────────────────────────────
   if (signalPresent && (now - lastFrameMs) > CRSF_SIGNAL_TIMEOUT_MS) {
@@ -461,7 +483,7 @@ void loop() {
     Serial.print(F("  ["));
     Serial.print(systemArmed ? F("ARMED") : F("SAFE "));
     Serial.print(F(" | Switch: "));
-    Serial.print((latestCh5 > SWITCH_THRESHOLD) ? F("ON ") : F("OFF"));
+    Serial.print((latestCh5 >= SWITCH_THRESHOLD) ? F("ON ") : F("OFF"));
     Serial.print(F(" | Flip: "));
     Serial.print(flipCount);
     Serial.println(F("]"));
